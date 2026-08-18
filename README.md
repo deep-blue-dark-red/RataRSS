@@ -14,6 +14,10 @@ RataRSS keeps every article you have ever fetched, compressed, on disk — and
 still opens one in about **35 microseconds**. It reads like a native app, runs in
 any terminal, and never makes you wait.
 
+![RataRSS three-pane layout](docs/screenshots/three-panes.png)
+
+<p align="center"><em>Sidebar, article list and reader — Catppuccin Macchiato.</em></p>
+
 ---
 
 ## Why it feels fast
@@ -84,6 +88,12 @@ pointer.
 
 Press `f` for **Zen mode** and the focused pane fills the screen.
 
+<p align="center">
+  <img src="docs/screenshots/zen-mode.png" alt="Zen mode: the article list filling the screen" width="480">
+</p>
+
+<p align="center"><em>Zen mode — one pane, nothing else.</em></p>
+
 ---
 
 ## Fuzzy finding
@@ -119,6 +129,10 @@ Press `/` for settings. Everything saves the moment you change it:
 - **Icons on or off** — every emoji in the interface disappears
 - **Shortcut hints** in the status bar, or toggle them anywhere with `??`
 - **Pane proportions**, auto-refresh, refresh interval, mark-read behaviour
+
+![Settings menu](docs/screenshots/settings.png)
+
+<p align="center"><em>Settings open over the Horizon theme. Every change saves immediately.</em></p>
 
 Every key is rebindable in `~/.config/ratarss/config.toml`.
 
