@@ -1,0 +1,29 @@
+[package]
+name = "ratarss"
+version = "0.1.0"
+edition = "2021"
+authors = ["mcp"]
+description = "A beautiful, minimal, themable, and customizable RSS reader in Ratatui in Rust resembling NetNewsWire"
+
+[dependencies]
+ratatui = { version = "0.29", features = ["all-widgets", "macros"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1.40", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "json"], default-features = false }
+feed-rs = "2.1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+directories = "5.0"
+open = "5.3"
+arboard = "3.4"
+unicode-width = "0.2"
+regex = "1.11"
+html-escape = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+uuid = { version = "1.10", features = ["v4"] }
+
