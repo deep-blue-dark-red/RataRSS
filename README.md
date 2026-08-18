@@ -10,19 +10,26 @@
 
 ## ✨ Features
 
-- 🖥️ **Modern 3-Pane TUI Layout**:
+- 🖥️ **Minimal 3-Pane TUI Layout**:
+  0. **No top bar**: the panes start at the first row. All chrome lives in a single status line — brand bottom-left, sync/toast state beside it, layout and theme on the right.
   1. **Sidebar**: Smart Feeds (☀️ *Today*, 🔵 *All Unread*, ⭐ *Starred*, 📜 *All Articles*) + Collapsible Folders with unread count badges.
   2. **Article List**: Multi-line article cards displaying unread indicators (`●`), star markers (`★`), bold titles, summary previews, source tags, and relative timestamps (`1:20 PM`, `Yesterday`).
-  3. **Reader View**: Clean typography, rich HTML/Markdown formatting (headings, blockquotes, code blocks, bullet points, links), and a clean line position indicator (`Line 1/18`).
+  3. **Reader View**: Clean typography, rich HTML/Markdown formatting (headings, blockquotes, code blocks, bullet points, links), and a clean line position indicator (`1/18`).
+  - **Declutter to taste**: adjustable content padding, article spacing in half-row steps, every icon and emoji removable, and shortcut hints hidden by default — toggle them with `??` or from `/`.
+  - **Clickable links**: anchors in article HTML are drawn underlined and open in your browser on click, as does the article's own URL.
 - ⚙️ **Interactive Configuration Menu (`/`)**:
   - Press `/` anywhere to toggle an interactive bottom popup menu.
-  - Configure themes, auto-refresh on startup, refresh intervals, mark-read behavior, text wrapping, and pane layout proportions live with instant persistence.
+  - Configure themes, auto-refresh on startup, refresh intervals, mark-read behavior, text wrapping, icons on/off, content padding, status-bar shortcut hints, and pane layout proportions live with instant persistence.
   - Full support for **user-configurable keybindings** saved in `~/.config/ratarss/config.toml`.
 - 🎨 **27 Built-in Themes & Full Palette Customization**:
   - Includes **RataRSS Dark** *(Default)*, **RataRSS Light**, **Catppuccin Mocha**, **Catppuccin Macchiato**, **Catppuccin Frappé**, **Catppuccin Latte**, **Tokyo Night**, **Tokyo Night Storm**, **Gruvbox Dark**, **Gruvbox Light**, **Nord**, **Dracula**, **Solarized Dark**, **Solarized Light**, **Rosé Pine**, **Rosé Pine Dawn**, **Rosé Pine Moon**, **Monokai Pro**, **One Dark**, **GitHub Dark**, **GitHub Light**, **Kanagawa**, **Everforest Dark**, **Everforest Light**, **Cyberpunk Neon**, **Horizon**, and **Minimal Monochrome**.
   - Interactive theme picker (`T` or `t`) with live search, smooth scrolling, and dynamic window sizing.
 - ⚡ **Optimized Performance & Battery Friendly**:
-  - Reactive event loop that sleeps when idle, eliminating wasteful CPU cycles while maintaining snappy 100ms response during live animations and syncing.
+  - Reactive event loop that sleeps when idle and coalesces input bursts, so held keys and scroll wheels never queue up behind redraws.
+  - Nothing is copied to draw a frame: panes borrow the article list, and the reader keeps its formatted text cached until the article, width or theme changes.
+  - Article bodies stay in SQLite. The list reads **no compressed column at all** — it draws a stored plain-text `snippet` — and only the single article on screen is ever decompressed.
+  - Views sort on a stored `sort_ts` key with covering indexes, so SQLite walks an index instead of sorting the whole table. On a real 13k-article database, opening *All Unread* went from ~177 ms (and 24 MB decompressed) to ~9 ms (and none).
+  - Read/star changes patch state in place instead of re-querying the database.
 - 📥 **Standard OPML Import & Export**:
   - Full support for standard OPML 1.0 & 2.0 files with nested folders and metadata.
   - Interactive import/export modals in-app (`a` for add/import, `e` for export).
@@ -31,6 +38,7 @@
   - Embedded **SQLite engine** with Write-Ahead Logging (`WAL` mode) and indexes for instant sub-millisecond queries.
   - Transparent **Zstandard (zstd level 3)** compression on all article bodies and summaries (75–85% disk space reduction).
   - Millions of articles can be stored and archived persistently with negligible disk usage and gigabytes/sec decompression.
+  - A single pooled connection with cached prepared statements; the legacy compression migration runs once and then marks itself done.
   - Automatic migration compresses any existing legacy articles seamlessly on startup.
 - 🌐 **Robust Multi-Feed Background Sync**:
   - Concurrent non-blocking background feed fetching with connection timeouts and auto-completion.

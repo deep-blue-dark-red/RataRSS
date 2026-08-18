@@ -1,4 +1,4 @@
-use crate::model::{ActivePane, Article};
+use crate::model::{ActivePane, ArticleSlice};
 use crate::theme::Theme;
 use chrono::{DateTime, Utc};
 
@@ -8,8 +8,50 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
+/// Height of one article card, in rows.
+pub const CARD_HEIGHT: u16 = 3;
+
+/// Row offset of the `k`-th visible card, given spacing measured in *half*
+/// rows.
+///
+/// A terminal cell cannot be split, so half-row spacing is achieved by
+/// distributing the gaps: at 1 half-row, every second card is preceded by a
+/// blank line, averaging half a row per card. Integer division does the
+/// distribution, which also keeps the gaps evenly spread at 1.5, 2.5 and so on.
+pub fn card_top(k: usize, spacing_halves: u16) -> u16 {
+    let k = k as u16;
+    k * CARD_HEIGHT + (k * spacing_halves) / 2
+}
+
+/// Human-readable form of a half-row spacing value: "0", "0.5", "1", ...
+pub fn spacing_label(spacing_halves: u16) -> String {
+    if spacing_halves % 2 == 0 {
+        format!("{}", spacing_halves / 2)
+    } else {
+        format!("{}.5", spacing_halves / 2)
+    }
+}
+
+/// The card occupying `row_offset` rows below the first visible card.
+pub fn card_at_row(row_offset: u16, spacing_halves: u16) -> usize {
+    let mut k = 0usize;
+    while card_top(k + 1, spacing_halves) <= row_offset {
+        k += 1;
+    }
+    k
+}
+
+/// How many cards fit entirely within `avail` rows.
+pub fn cards_fitting(avail: u16, spacing_halves: u16) -> usize {
+    let mut k = 0usize;
+    while card_top(k, spacing_halves) + CARD_HEIGHT <= avail {
+        k += 1;
+    }
+    k
+}
+
 pub struct ArticleListView<'a> {
-    pub articles: &'a [Article],
+    pub articles: ArticleSlice<'a>,
     pub selected_index: usize,
     pub active_pane: ActivePane,
     pub theme: &'a Theme,
@@ -18,6 +60,11 @@ pub struct ArticleListView<'a> {
     pub search_query: &'a str,
     pub is_searching: bool,
     pub scroll_offset: usize,
+    pub show_icons: bool,
+    pub padding: u16,
+    /// Gap between cards in *half* rows: 0 = flush, 1 = half a row on average,
+    /// 2 = a full row.
+    pub spacing: u16,
 }
 
 impl<'a> Widget for ArticleListView<'a> {
@@ -29,13 +76,16 @@ impl<'a> Widget for ArticleListView<'a> {
             self.theme.inactive_border_style()
         };
 
-        // Title with unread count
         let count_str = if self.unread_count > 0 {
-            format!(" ({} unread)", self.unread_count)
+            format!(" ({})", self.unread_count)
         } else {
             String::new()
         };
-        let pane_title = format!(" 📰 {}{count_str} ", self.header_title);
+        let pane_title = if self.show_icons {
+            format!(" 📰 {}{count_str} ", self.header_title)
+        } else {
+            format!(" {}{count_str} ", self.header_title)
+        };
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -57,6 +107,10 @@ impl<'a> Widget for ArticleListView<'a> {
             return;
         }
 
+        let pad = self.padding.min(inner_area.width.saturating_sub(1) / 2);
+        let text_x = inner_area.x + pad;
+        let text_width = inner_area.width.saturating_sub(pad * 2);
+
         let mut current_y = inner_area.y;
         let max_y = inner_area.y + inner_area.height;
 
@@ -69,15 +123,20 @@ impl<'a> Widget for ArticleListView<'a> {
                     Style::default().bg(self.theme.sidebar_bg).fg(self.theme.fg_dim)
                 };
 
-                for x in inner_area.x..inner_area.x + inner_area.width {
-                    buf.set_style(Rect::new(x, current_y, 1, 1), search_style);
-                }
+                buf.set_style(
+                    Rect::new(inner_area.x, current_y, inner_area.width, 1),
+                    search_style,
+                );
 
-                let search_text = format!(" 🔍 Search: {}{}", self.search_query, if self.is_searching { "█" } else { "" });
+                let prefix = if self.show_icons { " 🔍 " } else { " / " };
+                let search_text = format!(
+                    "{prefix}{}{}",
+                    self.search_query,
+                    if self.is_searching { "█" } else { "" }
+                );
                 buf.set_string(inner_area.x, current_y, &search_text, search_style);
                 current_y += 1;
 
-                // Subtle separator under search bar
                 if current_y < max_y {
                     let sep = "─".repeat(inner_area.width as usize);
                     buf.set_string(inner_area.x, current_y, &sep, Style::default().fg(self.theme.border_inactive));
@@ -89,12 +148,12 @@ impl<'a> Widget for ArticleListView<'a> {
         if self.articles.is_empty() {
             if current_y < max_y {
                 let empty_msg = if !self.search_query.is_empty() {
-                    "No matching articles found."
+                    "No matching articles."
                 } else {
                     "No articles in this feed."
                 };
                 buf.set_string(
-                    inner_area.x + 2,
+                    text_x,
                     current_y + 1,
                     empty_msg,
                     Style::default().fg(self.theme.fg_dim).add_modifier(Modifier::ITALIC),
@@ -103,9 +162,10 @@ impl<'a> Widget for ArticleListView<'a> {
             return;
         }
 
-        // Each card takes 3 lines
-        let card_height = 3;
-        let visible_cards = ((max_y.saturating_sub(current_y)) / card_height as u16) as usize;
+        let avail = max_y.saturating_sub(current_y);
+        // Cards that fit *entirely*; the selection is kept within these so it is
+        // never the one that gets clipped.
+        let visible_cards = cards_fitting(avail, self.spacing);
         let mut start_idx = self.scroll_offset;
         if self.selected_index < start_idx {
             start_idx = self.selected_index;
@@ -114,17 +174,25 @@ impl<'a> Widget for ArticleListView<'a> {
         }
         let end_idx = (start_idx + visible_cards + 1).min(self.articles.len());
 
-        let mut y = current_y;
+        // One clock read for the whole pane rather than one per card.
+        let now = Utc::now();
 
         for idx in start_idx..end_idx {
-            if y + (card_height as u16) > max_y {
+            let y = current_y + card_top(idx - start_idx, self.spacing);
+            if y >= max_y {
                 break;
             }
 
-            let article = &self.articles[idx];
+            let Some(article) = self.articles.get(idx) else {
+                break;
+            };
+
+            // Rows of this card that actually fit. The last card is drawn
+            // clipped rather than skipped, so the list runs to the bottom edge
+            // instead of leaving a ragged gap above it.
+            let rows = (max_y - y).min(CARD_HEIGHT);
             let is_selected = idx == self.selected_index;
 
-            // Background for the 3-line card
             let card_bg_style = if is_selected {
                 if is_focused {
                     Style::default().bg(self.theme.article_card_selected_bg)
@@ -135,26 +203,23 @@ impl<'a> Widget for ArticleListView<'a> {
                 Style::default().bg(self.theme.article_card_bg)
             };
 
-            for row_offset in 0..card_height as u16 {
-                for col in 0..inner_area.width {
-                    buf.set_style(Rect::new(inner_area.x + col, y + row_offset, 1, 1), card_bg_style);
-                }
-            }
+            // Whole card background in one call rather than width × 3 calls.
+            buf.set_style(Rect::new(inner_area.x, y, inner_area.width, rows), card_bg_style);
 
-            // Line 1: [Unread Dot / Star] [Title]
-            let unread_dot = if !article.read { "● " } else { "  " };
-            let star_icon = if article.starred { "★ " } else { "" };
-            let dot_style = Style::default().fg(self.theme.article_unread_dot);
-            let star_style = Style::default().fg(self.theme.article_star).add_modifier(Modifier::BOLD);
+            // Line 1: [Unread] [Star] [Title]
+            let unread_marker = match (article.read, self.show_icons) {
+                (false, true) => "● ",
+                (false, false) => "* ",
+                (true, _) => "  ",
+            };
+            let star_marker = match (article.starred, self.show_icons) {
+                (true, true) => "★ ",
+                (true, false) => "+ ",
+                (false, _) => "",
+            };
 
-            let prefix_spans = vec![
-                Span::styled(unread_dot, dot_style),
-                Span::styled(star_icon, star_style),
-            ];
-            let prefix_len = if !article.read { 2 } else { 2 } + if article.starred { 2 } else { 0 };
-
-            let title_avail_width = (inner_area.width as usize).saturating_sub(prefix_len + 1);
-            let title_text = truncate_string(&article.title, title_avail_width);
+            let prefix_len = 2 + if article.starred { 2 } else { 0 };
+            let title_avail_width = (text_width as usize).saturating_sub(prefix_len);
             let title_style = if is_selected && is_focused {
                 Style::default()
                     .fg(self.theme.selection_fg)
@@ -163,51 +228,58 @@ impl<'a> Widget for ArticleListView<'a> {
                 self.theme.title_style(!article.read)
             };
 
-            let mut line1_spans = prefix_spans;
-            line1_spans.push(Span::styled(title_text, title_style));
-            let line1 = Line::from(line1_spans);
-            buf.set_line(inner_area.x + 1, y, &line1, inner_area.width.saturating_sub(1));
+            let line1 = Line::from(vec![
+                Span::styled(unread_marker, Style::default().fg(self.theme.article_unread_dot)),
+                Span::styled(
+                    star_marker,
+                    Style::default().fg(self.theme.article_star).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(truncate_string(&article.title, title_avail_width), title_style),
+            ]);
+            buf.set_line(text_x, y, &line1, text_width);
 
             // Line 2: Snippet summary
-            let summary_text = article
-                .summary
-                .as_deref()
-                .unwrap_or("");
-            let clean_summary = truncate_string(summary_text, (inner_area.width as usize).saturating_sub(5));
-            let summary_style = Style::default().fg(self.theme.article_summary_fg);
-            let line2 = Line::from(vec![
-                Span::raw("    "),
-                Span::styled(clean_summary, summary_style),
-            ]);
-            buf.set_line(inner_area.x + 1, y + 1, &line2, inner_area.width.saturating_sub(1));
+            if rows > 1 {
+                let summary_text = article.summary.as_deref().unwrap_or("");
+                let clean_summary =
+                    truncate_string(summary_text, (text_width as usize).saturating_sub(4));
+                let line2 = Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        clean_summary,
+                        Style::default().fg(self.theme.article_summary_fg),
+                    ),
+                ]);
+                buf.set_line(text_x, y + 1, &line2, text_width);
+            }
 
             // Line 3: Feed Name (accent) + Relative Timestamp (aligned right)
             let feed_tag = &article.feed_title;
-            let time_str = format_relative_time(article.published.as_ref().unwrap_or(&article.created_at));
+            if rows > 2 {
+                let time_str =
+                    format_relative_time(article.published.as_ref().unwrap_or(&article.created_at), now);
+                let feed_span = Span::styled(
+                    format!("   {feed_tag}"),
+                    Style::default().fg(self.theme.article_meta_fg).add_modifier(Modifier::BOLD),
+                );
+                let feed_width = unicode_width::UnicodeWidthStr::width(feed_tag.as_str()) + 3;
+                let time_width = time_str.len() + 1;
 
-            let feed_style = Style::default().fg(self.theme.article_meta_fg).add_modifier(Modifier::BOLD);
-            let time_style = Style::default().fg(self.theme.fg_subtle);
+                buf.set_span(text_x, y + 2, &feed_span, text_width);
 
-            let feed_span = Span::styled(format!("    {feed_tag}"), feed_style);
-            let time_span = Span::styled(format!("{time_str} "), time_style);
-
-            let feed_width = unicode_width::UnicodeWidthStr::width(feed_tag.as_str()) + 4;
-            let time_width = time_str.len() + 1;
-
-            buf.set_span(inner_area.x + 1, y + 2, &feed_span, inner_area.width.saturating_sub(1));
-
-            if (inner_area.width as usize) > feed_width + time_width + 2 {
-                let time_x = inner_area.x + inner_area.width - (time_width as u16) - 1;
-                buf.set_span(time_x, y + 2, &time_span, time_width as u16);
+                if (text_width as usize) > feed_width + time_width + 1 {
+                    let time_span =
+                        Span::styled(time_str.as_str(), Style::default().fg(self.theme.fg_subtle));
+                    let time_x = text_x + text_width - (time_str.len() as u16);
+                    buf.set_span(time_x, y + 2, &time_span, time_str.len() as u16);
+                }
             }
 
-            y += card_height as u16;
         }
     }
 }
 
-fn format_relative_time(date: &DateTime<Utc>) -> String {
-    let now = Utc::now();
+fn format_relative_time(date: &DateTime<Utc>, now: DateTime<Utc>) -> String {
     let duration = now.signed_duration_since(*date);
 
     if duration.num_seconds() < 60 {

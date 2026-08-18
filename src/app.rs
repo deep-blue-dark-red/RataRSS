@@ -1,16 +1,32 @@
 use crate::config::{AppConfig, KeyBindingsConfig};
 use crate::fetcher::FeedFetcher;
-use crate::model::{ActivePane, Article, CurrentFilter, Feed, SidebarItem, SmartFeedKind};
+use crate::model::{ActivePane, Article, ArticleSlice, CurrentFilter, Feed, SidebarItem, SmartFeedKind};
 use crate::opml::{export_opml, parse_opml_file};
 use crate::storage::{Database, UnreadCounts};
 use crate::theme::Theme;
 use crate::ui::modals::{ConfigSubView, ModalHelper};
 use ratatui::layout::Rect;
 
+use crate::reader::{render_article_to_text, FormattedArticle};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 use tokio::runtime::Handle;
+
+/// The reader pane's formatted output, kept between frames.
+///
+/// Formatting an article means decompressing its body, stripping HTML and
+/// wrapping every paragraph. That was happening on every single frame — so
+/// holding `j` in the reader re-parsed the whole document per keypress. The
+/// cache is keyed on everything the output depends on, so scrolling reuses it
+/// and any real change (different article, resized pane, new theme) misses.
+pub struct ReaderCache {
+    pub article_id: String,
+    pub width: u16,
+    pub theme_name: String,
+    pub formatted: FormattedArticle,
+}
 
 #[allow(dead_code)]
 pub enum AppEvent {
@@ -25,6 +41,51 @@ pub enum AppEvent {
         articles: Vec<Article>,
         error: Option<String>,
     },
+}
+
+/// Number of rows in the main configuration menu.
+const CONFIG_MENU_ITEMS: usize = 11;
+
+/// Largest content padding, in cells, offered by the settings menu.
+const MAX_PADDING: u16 = 6;
+
+/// Largest gap between article cards, in *half* rows, offered by the settings
+/// menu (6 halves = 3 rows).
+const MAX_ARTICLE_SPACING: u16 = 6;
+
+/// Saturating add of a signed delta to an unread counter.
+fn adjust(counter: &mut usize, delta: isize) {
+    if delta >= 0 {
+        *counter = counter.saturating_add(delta as usize);
+    } else {
+        *counter = counter.saturating_sub(delta.unsigned_abs());
+    }
+}
+
+/// Case-insensitive substring test that allocates nothing.
+///
+/// `needle` must already be lowercase. The previous search lowercased every
+/// title, summary and author of every article on each keystroke, which meant
+/// allocating a copy of the entire visible corpus per typed character.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+
+    // ASCII fast path covers essentially all feed text.
+    if haystack.is_ascii() && needle.is_ascii() {
+        let hay = haystack.as_bytes();
+        let ned = needle.as_bytes();
+        return hay
+            .windows(ned.len())
+            .any(|w| w.eq_ignore_ascii_case(ned));
+    }
+
+    let hay_lower = haystack.to_lowercase();
+    hay_lower.contains(needle)
 }
 
 pub struct App {
@@ -48,17 +109,29 @@ pub struct App {
     pub sidebar_selected_idx: usize,
     pub sidebar_scroll_offset: usize,
     pub unread_counts: UnreadCounts,
+    /// Folders the user has collapsed. Cached because the sidebar is rebuilt
+    /// after every read/star change and this would otherwise be a query per
+    /// rebuild.
+    collapsed_folders: std::collections::HashSet<String>,
 
     // Article List State
     pub current_filter: CurrentFilter,
     pub current_view_title: String,
     pub current_view_unread_count: usize,
     pub articles: Vec<Article>,
+    /// Indices into `articles` that survive the current search, or `None` when
+    /// there is no search and the list is shown as-is. Recomputed only when the
+    /// query or the article list changes — never per frame.
+    filtered: Option<Vec<u32>>,
     pub article_selected_idx: usize,
     pub article_scroll_offset: usize,
 
     // Reader State
     pub reader_scroll_offset: usize,
+    reader_cache: RefCell<Option<ReaderCache>>,
+    /// Where the reader last drew article text, recorded during render so a
+    /// click can be mapped onto the link that was drawn under it.
+    reader_text_area: Cell<Rect>,
 
     // Search & Filter State
     pub search_query: String,
@@ -129,15 +202,19 @@ impl App {
             sidebar_selected_idx: 1, // Start on 'Today'
             sidebar_scroll_offset: 0,
             unread_counts: UnreadCounts::default(),
+            collapsed_folders: std::collections::HashSet::new(),
 
             current_filter: CurrentFilter::Smart(SmartFeedKind::Today),
             current_view_title: "Today".to_string(),
             current_view_unread_count: 0,
             articles: Vec::new(),
+            filtered: None,
             article_selected_idx: 0,
             article_scroll_offset: 0,
 
             reader_scroll_offset: 0,
+            reader_cache: RefCell::new(None),
+            reader_text_area: Cell::new(Rect::new(0, 0, 0, 0)),
 
             search_query: String::new(),
             is_searching: false,
@@ -191,6 +268,8 @@ impl App {
             self.feeds = feeds;
         }
 
+        self.collapsed_folders = self.db.get_collapsed_folders();
+
         if let Ok(counts) = self.db.get_unread_counts() {
             self.unread_counts = counts;
         }
@@ -210,19 +289,23 @@ impl App {
         items.push(SidebarItem::Smart(SmartFeedKind::AllArticles, self.unread_counts.all_articles));
 
         // 2. Custom Folders and Feeds
-        let mut folder_map: std::collections::BTreeMap<Option<String>, Vec<Feed>> = std::collections::BTreeMap::new();
+        //
+        // Group by borrowing the feeds rather than cloning each one into the
+        // map — this runs on every data reload.
+        let mut folder_map: std::collections::BTreeMap<Option<&str>, Vec<&Feed>> =
+            std::collections::BTreeMap::new();
         for f in &self.feeds {
-            folder_map.entry(f.folder.clone()).or_default().push(f.clone());
+            folder_map.entry(f.folder.as_deref()).or_default().push(f);
         }
 
         for (folder_opt, mut folder_feeds) in folder_map {
             match folder_opt {
                 Some(folder_name) => {
-                    let is_expanded = self.db.is_folder_expanded(&folder_name);
-                    let (folder_unread, _) = self.unread_counts.folder_counts.get(&folder_name).cloned().unwrap_or((0, 0));
+                    let is_expanded = !self.collapsed_folders.contains(folder_name);
+                    let (folder_unread, _) = self.unread_counts.folder_counts.get(folder_name).cloned().unwrap_or((0, 0));
 
                     items.push(SidebarItem::FolderHeader {
-                        name: folder_name.clone(),
+                        name: folder_name.to_string(),
                         is_expanded,
                         unread_count: folder_unread,
                         feed_count: folder_feeds.len(),
@@ -235,7 +318,7 @@ impl App {
                             items.push(SidebarItem::Feed {
                                 feed_id: f.id.clone(),
                                 title: f.title.clone(),
-                                folder: Some(folder_name.clone()),
+                                folder: Some(folder_name.to_string()),
                                 unread_count: unread,
                                 has_error: f.error.is_some(),
                             });
@@ -269,13 +352,17 @@ impl App {
             self.articles = articles;
         } else {
             self.articles.clear();
+            self.articles.shrink_to_fit();
         }
 
+        self.recompute_filter();
+        self.invalidate_reader_cache();
         self.current_view_unread_count = self.articles.iter().filter(|a| !a.read).count();
 
         // Adjust selected index
-        if self.article_selected_idx >= self.articles.len() && !self.articles.is_empty() {
-            self.article_selected_idx = self.articles.len() - 1;
+        let visible = self.visible_len();
+        if self.article_selected_idx >= visible && visible > 0 {
+            self.article_selected_idx = visible - 1;
         }
 
         self.reader_scroll_offset = 0;
@@ -286,22 +373,141 @@ impl App {
         }
     }
 
-    pub fn get_filtered_articles(&self) -> Vec<Article> {
-        if self.search_query.trim().is_empty() {
-            return self.articles.clone();
+    /// Recompute which articles the search matches.
+    ///
+    /// Called when the query or the underlying list changes — not on every
+    /// access. With no query the result is `None`, meaning "all of `articles`",
+    /// so the common case stores nothing at all.
+    fn recompute_filter(&mut self) {
+        let query = self.search_query.trim();
+        if query.is_empty() {
+            self.filtered = None;
+            return;
         }
 
-        let q = self.search_query.to_lowercase();
-        self.articles
-            .iter()
-            .filter(|a| {
-                a.title.to_lowercase().contains(&q)
-                    || a.feed_title.to_lowercase().contains(&q)
-                    || a.summary.as_deref().unwrap_or("").to_lowercase().contains(&q)
-                    || a.author.as_deref().unwrap_or("").to_lowercase().contains(&q)
-            })
-            .cloned()
-            .collect()
+        let needle: String = query.to_lowercase();
+        let mut matches: Vec<u32> = Vec::new();
+        for (idx, a) in self.articles.iter().enumerate() {
+            let hit = contains_ignore_case(&a.title, &needle)
+                || contains_ignore_case(&a.feed_title, &needle)
+                || a.summary.as_deref().is_some_and(|s| contains_ignore_case(s, &needle))
+                || a.author.as_deref().is_some_and(|s| contains_ignore_case(s, &needle));
+            if hit {
+                matches.push(idx as u32);
+            }
+        }
+        matches.shrink_to_fit();
+        self.filtered = Some(matches);
+    }
+
+    /// Number of articles currently visible in the list pane.
+    pub fn visible_len(&self) -> usize {
+        match &self.filtered {
+            Some(idx) => idx.len(),
+            None => self.articles.len(),
+        }
+    }
+
+    /// Borrow the visible article at `pos` in the list pane.
+    pub fn visible_article(&self, pos: usize) -> Option<&Article> {
+        match &self.filtered {
+            Some(idx) => idx.get(pos).and_then(|i| self.articles.get(*i as usize)),
+            None => self.articles.get(pos),
+        }
+    }
+
+    /// Index into `self.articles` of the visible article at `pos`.
+    fn source_index(&self, pos: usize) -> Option<usize> {
+        match &self.filtered {
+            Some(idx) => idx.get(pos).map(|i| *i as usize),
+            None => (pos < self.articles.len()).then_some(pos),
+        }
+    }
+
+    pub fn selected_article(&self) -> Option<&Article> {
+        self.visible_article(self.article_selected_idx)
+    }
+
+    /// The article list as the widgets see it: the full list plus the optional
+    /// index of search matches, so nothing is copied to render a frame.
+    pub fn visible_articles(&self) -> ArticleSlice<'_> {
+        ArticleSlice {
+            all: &self.articles,
+            filtered: self.filtered.as_deref(),
+        }
+    }
+
+    /// Update the search query and refresh the match set.
+    pub fn set_search_query(&mut self, edit: impl FnOnce(&mut String)) {
+        edit(&mut self.search_query);
+        self.article_selected_idx = 0;
+        self.article_scroll_offset = 0;
+        self.recompute_filter();
+    }
+
+    /// The formatted reader output for the current selection, rendering it only
+    /// when the cache misses. Takes `&self` so it can run inside the draw
+    /// closure; see [`ReaderCache`].
+    pub fn with_formatted_article<R>(
+        &self,
+        width: u16,
+        f: impl FnOnce(Option<&FormattedArticle>) -> R,
+    ) -> R {
+        let article = match self.selected_article() {
+            Some(a) => a,
+            None => return f(None),
+        };
+
+        let mut cache = self.reader_cache.borrow_mut();
+        let fresh = cache.as_ref().is_some_and(|c| {
+            c.article_id == article.id && c.width == width && c.theme_name == self.theme.config.name
+        });
+
+        if !fresh {
+            // The body lives in SQLite, not in the article list; fetching it
+            // here means only the article actually on screen is ever decompressed.
+            let body = self.db.get_article_body(&article.id);
+            let formatted = render_article_to_text(article, body.as_deref(), &self.theme, width);
+            *cache = Some(ReaderCache {
+                article_id: article.id.clone(),
+                width,
+                theme_name: self.theme.config.name.clone(),
+                formatted,
+            });
+        }
+
+        f(cache.as_ref().map(|c| &c.formatted))
+    }
+
+    /// Record the reader's text region; called from the draw path.
+    pub fn set_reader_text_area(&self, area: Rect) {
+        self.reader_text_area.set(area);
+    }
+
+    /// The URL drawn at a screen position in the reader, if any.
+    fn reader_link_at(&self, col: u16, row: u16) -> Option<String> {
+        let area = self.reader_text_area.get();
+        if area.width == 0
+            || area.height == 0
+            || col < area.x
+            || col >= area.x + area.width
+            || row < area.y
+            || row >= area.y + area.height
+        {
+            return None;
+        }
+
+        let line = self.reader_scroll_offset + (row - area.y) as usize;
+        let cache = self.reader_cache.borrow();
+        cache
+            .as_ref()?
+            .formatted
+            .link_at(line, col - area.x)
+            .map(str::to_string)
+    }
+
+    fn invalidate_reader_cache(&mut self) {
+        self.reader_cache.get_mut().take();
     }
 
     pub fn on_tick(&mut self) -> bool {
@@ -386,6 +592,14 @@ impl App {
         had_updates || self.is_syncing || self.modal_is_loading
     }
 
+    /// Show or hide the compact shortcut hints in the status bar (`??`).
+    pub fn toggle_help_hints(&mut self) {
+        self.config.show_help_hints = !self.config.show_help_hints;
+        let _ = self.config.save();
+        let status = if self.config.show_help_hints { "shown" } else { "hidden" };
+        self.set_toast(format!("Shortcut hints {status}"));
+    }
+
     pub fn set_toast<S: Into<String>>(&mut self, msg: S) {
         self.toast_message = Some(msg.into());
         self.toast_time = Some(Instant::now());
@@ -393,9 +607,18 @@ impl App {
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         // 1. Help Modal Handler
+        //
+        // Pressing the help key a second time (`??`) closes the modal *and*
+        // toggles the compact hint line in the status bar, so the shortcuts can
+        // be summoned or dismissed without opening the settings menu.
         if self.show_help_modal {
-            if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') || key.code == KeyCode::Char('q') {
-                self.show_help_modal = false;
+            match key.code {
+                KeyCode::Char('?') | KeyCode::F(1) => {
+                    self.show_help_modal = false;
+                    self.toggle_help_hints();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => self.show_help_modal = false,
+                _ => {}
             }
             return;
         }
@@ -508,19 +731,18 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.is_searching = false;
-                    self.search_query.clear();
-                    self.article_selected_idx = 0;
+                    self.set_search_query(|q| q.clear());
                 }
                 KeyCode::Enter => {
                     self.is_searching = false;
                 }
                 KeyCode::Backspace => {
-                    self.search_query.pop();
-                    self.article_selected_idx = 0;
+                    self.set_search_query(|q| {
+                        q.pop();
+                    });
                 }
                 KeyCode::Char(c) => {
-                    self.search_query.push(c);
-                    self.article_selected_idx = 0;
+                    self.set_search_query(|q| q.push(c));
                 }
                 _ => {}
             }
@@ -588,7 +810,7 @@ impl App {
         if kb.matches(&key, &kb.search) {
             self.active_pane = ActivePane::ArticleList;
             self.is_searching = true;
-            self.search_query.clear();
+            self.set_search_query(|q| q.clear());
             return;
         }
 
@@ -771,7 +993,7 @@ impl App {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.config_menu_selected_idx + 1 < 8 {
+                    if self.config_menu_selected_idx + 1 < CONFIG_MENU_ITEMS {
                         self.config_menu_selected_idx += 1;
                     }
                 }
@@ -834,6 +1056,33 @@ impl App {
                 self.set_toast(format!("Show icons & badges: {status}"));
             }
             6 => {
+                // Content padding inside each pane
+                self.config.padding = if forward {
+                    (self.config.padding + 1).min(MAX_PADDING)
+                } else {
+                    self.config.padding.saturating_sub(1)
+                };
+                let _ = self.config.save();
+                self.invalidate_reader_cache();
+                self.set_toast(format!("Padding: {} cell(s)", self.config.padding));
+            }
+            7 => {
+                // Vertical gap between article cards
+                self.config.article_spacing = if forward {
+                    (self.config.article_spacing + 1).min(MAX_ARTICLE_SPACING)
+                } else {
+                    self.config.article_spacing.saturating_sub(1)
+                };
+                let _ = self.config.save();
+                self.set_toast(format!(
+                    "Article spacing: {} row(s)",
+                    crate::ui::article_list::spacing_label(self.config.article_spacing)
+                ));
+            }
+            8 => {
+                self.toggle_help_hints();
+            }
+            9 => {
                 // Layout percentages
                 if forward {
                     if self.sidebar_width_percent < 35 {
@@ -849,7 +1098,7 @@ impl App {
                 self.config.reader_ratio = self.reader_width_percent;
                 let _ = self.config.save();
             }
-            7 => {
+            10 => {
                 // Keybindings subview
                 self.config_menu_subview = ConfigSubView::Keybindings;
                 self.config_keybind_selected_idx = 0;
@@ -904,6 +1153,26 @@ impl App {
                 self.set_toast(format!("Show icons & badges: {status}"));
             }
             6 => {
+                // Cycle padding, wrapping back to none.
+                self.config.padding = (self.config.padding + 1) % (MAX_PADDING + 1);
+                let _ = self.config.save();
+                self.invalidate_reader_cache();
+                self.set_toast(format!("Padding: {} cell(s)", self.config.padding));
+            }
+            7 => {
+                // Cycle spacing, wrapping back to flush.
+                self.config.article_spacing =
+                    (self.config.article_spacing + 1) % (MAX_ARTICLE_SPACING + 1);
+                let _ = self.config.save();
+                self.set_toast(format!(
+                    "Article spacing: {} row(s)",
+                    crate::ui::article_list::spacing_label(self.config.article_spacing)
+                ));
+            }
+            8 => {
+                self.toggle_help_hints();
+            }
+            9 => {
                 self.sidebar_width_percent = 22;
                 self.article_width_percent = 33;
                 self.reader_width_percent = 45;
@@ -913,7 +1182,7 @@ impl App {
                 let _ = self.config.save();
                 self.set_toast("Reset pane layout ratios to 22/33/45");
             }
-            7 => {
+            10 => {
                 self.config_menu_subview = ConfigSubView::Keybindings;
                 self.config_keybind_selected_idx = 0;
             }
@@ -985,7 +1254,7 @@ impl App {
                 }
             } else {
                 if down {
-                    if self.config_menu_selected_idx + 1 < 8 {
+                    if self.config_menu_selected_idx + 1 < CONFIG_MENU_ITEMS {
                         self.config_menu_selected_idx += 1;
                     }
                 } else if self.config_menu_selected_idx > 0 {
@@ -1088,7 +1357,7 @@ impl App {
                 let popup = ModalHelper::bottom_sheet_rect(88, 15, Rect::new(0, 0, width, height));
                 if col >= popup.x && col < popup.x + popup.width && row >= popup.y && row < popup.y + popup.height {
                     let inner_y = popup.y + 1;
-                    if row >= inner_y && row < inner_y + 8 {
+                    if row >= inner_y && row < inner_y + CONFIG_MENU_ITEMS as u16 {
                         let clicked_item = (row - inner_y) as usize;
                         self.config_menu_selected_idx = clicked_item;
                         if col > popup.x + 30 {
@@ -1151,52 +1420,14 @@ impl App {
             return;
         }
 
-        // 2. Top Header Bar (`row == 0`)
-        if row == 0 {
-            let shortcuts = " [?] Help  [/] Config  [T] Themes  [a] Add  [r] Refresh  [f] Zen  [q] Quit ";
-            let short_len = shortcuts.len() as u16;
-            if width > short_len + 28 {
-                let right_x = width - short_len;
-                if col >= right_x {
-                    let offset = col - right_x;
-                    if offset < 10 {
-                        self.show_help_modal = true;
-                    } else if offset < 22 {
-                        self.show_config_modal = true;
-                        self.config_menu_subview = ConfigSubView::Main;
-                    } else if offset < 34 {
-                        self.show_theme_modal = true;
-                        self.theme_picker_selected_idx = self
-                            .all_themes
-                            .iter()
-                            .position(|t| t.config.name.eq_ignore_ascii_case(&self.theme.config.name))
-                            .unwrap_or(0);
-                    } else if offset < 43 {
-                        self.show_add_modal = true;
-                        self.modal_url_input.clear();
-                        self.modal_folder_input.clear();
-                    } else if offset < 56 {
-                        self.refresh_all_feeds();
-                    } else if offset < 65 {
-                        self.is_zen_mode = !self.is_zen_mode;
-                    } else {
-                        self.should_quit = true;
-                    }
-                    return;
-                }
-            }
-            self.active_pane = ActivePane::Sidebar;
-            return;
-        }
-
-        // 3. Bottom Status Bar (`row == height - 1`)
+        // 2. Bottom Status Bar (`row == height - 1`) — the only chrome line left.
         if row == height.saturating_sub(1) {
             self.show_config_modal = !self.show_config_modal;
             self.config_menu_subview = ConfigSubView::Main;
             return;
         }
 
-        // 4. Main Body Panes (`row >= 1 && row < height - 1`)
+        // 3. Main Body Panes (`row < height - 1`; the body now starts at row 0)
         let sidebar_w = width * self.sidebar_width_percent / 100;
         let article_w = width * self.article_width_percent / 100;
 
@@ -1222,8 +1453,9 @@ impl App {
     }
 
     fn handle_sidebar_click(&mut self, row: u16) {
-        if row >= 2 {
-            let clicked_row = (row - 2) as usize + self.sidebar_scroll_offset;
+        // Row 0 is the pane border; the first item sits on row 1.
+        if row >= 1 {
+            let clicked_row = (row - 1) as usize + self.sidebar_scroll_offset;
             if clicked_row < self.sidebar_items.len() {
                 self.sidebar_selected_idx = clicked_row;
                 if let Some(SidebarItem::FolderHeader { name, .. }) = self.sidebar_items.get(clicked_row) {
@@ -1239,19 +1471,22 @@ impl App {
 
     fn handle_article_list_click(&mut self, row: u16) {
         let search_active = self.is_searching || !self.search_query.is_empty();
-        let card_start_y = if search_active { 4 } else { 2 };
+        // Border on row 0, then the search bar and its separator when active.
+        let card_start_y = if search_active { 3 } else { 1 };
 
-        if row >= 2 && row < card_start_y {
+        if row >= 1 && row < card_start_y {
             self.is_searching = true;
             return;
         }
 
         if row >= card_start_y {
-            let card_offset = ((row - card_start_y) / 3) as usize;
+            let card_offset = crate::ui::article_list::card_at_row(
+                row - card_start_y,
+                self.config.article_spacing,
+            );
             let target_idx = self.article_scroll_offset + card_offset;
-            let filtered = self.get_filtered_articles();
 
-            if target_idx < filtered.len() {
+            if target_idx < self.visible_len() {
                 if target_idx == self.article_selected_idx {
                     self.active_pane = ActivePane::Reader;
                     self.mark_current_article_read();
@@ -1266,22 +1501,21 @@ impl App {
         }
     }
 
-    fn handle_reader_click(&mut self, col: u16, row: u16, pane_x: u16) {
-        if row == 1 {
-            let rel_x = col.saturating_sub(pane_x);
-            if rel_x > 20 {
-                let btn_offset = rel_x - 20;
-                if btn_offset < 17 {
-                    self.open_current_article_in_browser();
-                } else if btn_offset < 34 {
-                    self.toggle_current_article_read();
-                } else if btn_offset < 44 {
-                    self.toggle_current_article_star();
-                } else {
-                    self.copy_current_article_url();
-                }
+    /// A click on a link opens it; anywhere else in the pane scrolls.
+    fn handle_reader_click(&mut self, col: u16, row: u16, _pane_x: u16) {
+        if let Some(url) = self.reader_link_at(col, row) {
+            // Feeds carry relative and `javascript:` hrefs; handing those to
+            // the OS opener does nothing useful, so say so instead.
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                self.set_toast(format!("Not an absolute link: {url}"));
                 return;
             }
+            if let Err(e) = open::that(&url) {
+                self.set_toast(format!("Failed to open link: {e}"));
+            } else {
+                self.set_toast(format!("Opened link: {url}"));
+            }
+            return;
         }
 
         if row < 12 {
@@ -1303,8 +1537,7 @@ impl App {
                 }
             }
             ActivePane::ArticleList => {
-                let filtered = self.get_filtered_articles();
-                if self.article_selected_idx + 1 < filtered.len() {
+                if self.article_selected_idx + 1 < self.visible_len() {
                     self.article_selected_idx += 1;
                     self.reader_scroll_offset = 0;
                     if self.config.mark_read_on_open {
@@ -1353,8 +1586,8 @@ impl App {
                 self.apply_sidebar_selection();
             }
             ActivePane::ArticleList => {
-                let filtered = self.get_filtered_articles();
-                self.article_selected_idx = (self.article_selected_idx + 6).min(filtered.len().saturating_sub(1));
+                self.article_selected_idx =
+                    (self.article_selected_idx + 6).min(self.visible_len().saturating_sub(1));
                 self.reader_scroll_offset = 0;
             }
             ActivePane::Reader => {
@@ -1406,8 +1639,7 @@ impl App {
                 self.apply_sidebar_selection();
             }
             ActivePane::ArticleList => {
-                let filtered = self.get_filtered_articles();
-                self.article_selected_idx = filtered.len().saturating_sub(1);
+                self.article_selected_idx = self.visible_len().saturating_sub(1);
                 self.reader_scroll_offset = 0;
             }
             ActivePane::Reader => {
@@ -1465,36 +1697,98 @@ impl App {
         }
     }
 
-    pub fn toggle_current_article_read(&mut self) {
-        let filtered = self.get_filtered_articles();
-        if let Some(article) = filtered.get(self.article_selected_idx) {
-            let new_read = !article.read;
-            let _ = self.db.set_article_read(&article.id, new_read);
-            self.reload_data();
-            let status = if new_read { "read" } else { "unread" };
-            self.set_toast(format!("Marked article as {status}"));
+    /// Apply a read/unread change to the database and patch the in-memory
+    /// state to match.
+    ///
+    /// This used to call `reload_data()`, which re-queried every feed, every
+    /// unread count and the entire article list. With `mark_read_on_open`
+    /// enabled that ran on every `j`/`k`, so simply scrolling the list
+    /// re-read the whole database — the single worst stall in the UI. Nothing
+    /// about a read flag can change which articles are in the list except the
+    /// "All Unread" view, which is handled explicitly below.
+    fn apply_read_change(&mut self, pos: usize, read: bool) {
+        let Some(src) = self.source_index(pos) else {
+            return;
+        };
+        let Some(article) = self.articles.get_mut(src) else {
+            return;
+        };
+        if article.read == read {
+            return;
         }
+
+        article.read = read;
+        let id = article.id.clone();
+        let feed_id = article.feed_id.clone();
+        let _ = self.db.set_article_read(&id, read);
+
+        let delta: isize = if read { -1 } else { 1 };
+        adjust(&mut self.current_view_unread_count, delta);
+        adjust(&mut self.unread_counts.all_unread, delta);
+        adjust(&mut self.unread_counts.today, delta);
+        if let Some((unread, _)) = self.unread_counts.feed_counts.get_mut(&feed_id) {
+            adjust(unread, delta);
+        }
+        let folder = self
+            .feeds
+            .iter()
+            .find(|f| f.id == feed_id)
+            .and_then(|f| f.folder.clone());
+        if let Some(folder) = folder {
+            if let Some((unread, _)) = self.unread_counts.folder_counts.get_mut(&folder) {
+                adjust(unread, delta);
+            }
+        }
+
+        self.rebuild_sidebar_items();
+
+        // "All Unread" is the one view whose membership depends on the flag, so
+        // it does need the list rebuilt.
+        if matches!(self.current_filter, CurrentFilter::Smart(SmartFeedKind::AllUnread)) && read {
+            self.reload_articles();
+        }
+    }
+
+    pub fn toggle_current_article_read(&mut self) {
+        let Some(article) = self.selected_article() else {
+            return;
+        };
+        let new_read = !article.read;
+        self.apply_read_change(self.article_selected_idx, new_read);
+        let status = if new_read { "read" } else { "unread" };
+        self.set_toast(format!("Marked article as {status}"));
     }
 
     pub fn mark_current_article_read(&mut self) {
-        let filtered = self.get_filtered_articles();
-        if let Some(article) = filtered.get(self.article_selected_idx) {
-            if !article.read {
-                let _ = self.db.set_article_read(&article.id, true);
-                self.reload_data();
-            }
-        }
+        self.apply_read_change(self.article_selected_idx, true);
     }
 
     pub fn toggle_current_article_star(&mut self) {
-        let filtered = self.get_filtered_articles();
-        if let Some(article) = filtered.get(self.article_selected_idx) {
-            let new_starred = !article.starred;
-            let _ = self.db.set_article_starred(&article.id, new_starred);
-            self.reload_data();
-            let status = if new_starred { "starred ★" } else { "unstarred" };
-            self.set_toast(format!("Article {status}"));
+        let Some(src) = self.source_index(self.article_selected_idx) else {
+            return;
+        };
+        let Some(article) = self.articles.get_mut(src) else {
+            return;
+        };
+
+        let new_starred = !article.starred;
+        article.starred = new_starred;
+        let id = article.id.clone();
+        let _ = self.db.set_article_starred(&id, new_starred);
+
+        adjust(
+            &mut self.unread_counts.starred,
+            if new_starred { 1 } else { -1 },
+        );
+        self.rebuild_sidebar_items();
+
+        // Same as read state: only the Starred view can lose or gain a row.
+        if matches!(self.current_filter, CurrentFilter::Smart(SmartFeedKind::Starred)) {
+            self.reload_articles();
         }
+
+        let status = if new_starred { "starred ★" } else { "unstarred" };
+        self.set_toast(format!("Article {status}"));
     }
 
     pub fn mark_all_in_view_read(&mut self) {
@@ -1504,30 +1798,29 @@ impl App {
     }
 
     pub fn open_current_article_in_browser(&mut self) {
-        let filtered = self.get_filtered_articles();
-        if let Some(article) = filtered.get(self.article_selected_idx) {
-            let url = &article.url;
-            if !url.is_empty() {
-                if let Err(e) = open::that(url) {
-                    self.set_toast(format!("Failed to open browser: {e}"));
-                } else {
-                    self.set_toast(format!("Opened in browser: {url}"));
-                }
-            }
+        let Some(url) = self.selected_article().map(|a| a.url.clone()) else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        if let Err(e) = open::that(&url) {
+            self.set_toast(format!("Failed to open browser: {e}"));
+        } else {
+            self.set_toast(format!("Opened in browser: {url}"));
         }
     }
 
     pub fn copy_current_article_url(&mut self) {
-        let filtered = self.get_filtered_articles();
-        if let Some(article) = filtered.get(self.article_selected_idx) {
-            let url = &article.url;
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                let _ = clipboard.set_text(url.clone());
-                self.set_toast(format!("Copied URL to clipboard: {url}"));
-                return;
-            }
-            self.set_toast(format!("URL: {url}"));
+        let Some(url) = self.selected_article().map(|a| a.url.clone()) else {
+            return;
+        };
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_text(url.clone());
+            self.set_toast(format!("Copied URL to clipboard: {url}"));
+            return;
         }
+        self.set_toast(format!("URL: {url}"));
     }
 
     pub fn refresh_current_feed(&mut self) {

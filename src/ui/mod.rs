@@ -19,67 +19,38 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
+/// Compact shortcut hints shown in the status bar when enabled (`??`).
+const HELP_HINTS: &str = "? help · / config · T theme · a add · r sync · f zen · q quit";
+
 pub fn render_app(app: &App, frame: &mut Frame) {
     let area = frame.area();
     let theme = &app.theme;
 
-    // Outer layout: Top Header Bar (1 line), Main 3-Pane Body, Bottom Status Bar (1 line)
+    // The old top header bar is gone: the brand, sync state and shortcut hints
+    // all live in the single status line now, so the panes get that row back.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Top Header Bar
-            Constraint::Min(10),   // 3-Pane Body
+            Constraint::Min(3),    // 3-Pane Body
             Constraint::Length(1), // Bottom Status Bar
         ])
         .split(area);
 
-    let top_bar_area = chunks[0];
-    let body_area = chunks[1];
-    let status_bar_area = chunks[2];
-
-    // --- Render Top Header Bar ---
-    render_header_bar(app, top_bar_area, frame.buffer_mut());
+    let body_area = chunks[0];
+    let status_bar_area = chunks[1];
 
     // --- Render Main Body ---
     if app.is_zen_mode {
         // Fullscreen active pane (usually reader or articles)
         match app.active_pane {
             ActivePane::Sidebar => {
-                let sidebar = SidebarView {
-                    items: &app.sidebar_items,
-                    selected_index: app.sidebar_selected_idx,
-                    active_pane: app.active_pane,
-                    theme,
-                    scroll_offset: app.sidebar_scroll_offset,
-                };
-                frame.render_widget(sidebar, body_area);
+                frame.render_widget(sidebar_view(app), body_area);
             }
             ActivePane::ArticleList => {
-                let current_articles = app.get_filtered_articles();
-                let article_list = ArticleListView {
-                    articles: &current_articles,
-                    selected_index: app.article_selected_idx,
-                    active_pane: app.active_pane,
-                    theme,
-                    header_title: &app.current_view_title,
-                    unread_count: app.current_view_unread_count,
-                    search_query: &app.search_query,
-                    is_searching: app.is_searching,
-                    scroll_offset: app.article_scroll_offset,
-                };
-                frame.render_widget(article_list, body_area);
+                frame.render_widget(article_list_view(app), body_area);
             }
             ActivePane::Reader => {
-                let current_articles = app.get_filtered_articles();
-                let selected_article = current_articles.get(app.article_selected_idx);
-                let reader = ReaderView {
-                    article: selected_article,
-                    active_pane: app.active_pane,
-                    theme,
-                    scroll_offset: app.reader_scroll_offset,
-                    is_zen_mode: true,
-                };
-                frame.render_widget(reader, body_area);
+                render_reader(app, body_area, true, frame);
             }
         }
     } else {
@@ -93,41 +64,9 @@ pub fn render_app(app: &App, frame: &mut Frame) {
             ])
             .split(body_area);
 
-        // 1. Sidebar Pane
-        let sidebar = SidebarView {
-            items: &app.sidebar_items,
-            selected_index: app.sidebar_selected_idx,
-            active_pane: app.active_pane,
-            theme,
-            scroll_offset: app.sidebar_scroll_offset,
-        };
-        frame.render_widget(sidebar, pane_chunks[0]);
-
-        // 2. Article List Pane
-        let current_articles = app.get_filtered_articles();
-        let article_list = ArticleListView {
-            articles: &current_articles,
-            selected_index: app.article_selected_idx,
-            active_pane: app.active_pane,
-            theme,
-            header_title: &app.current_view_title,
-            unread_count: app.current_view_unread_count,
-            search_query: &app.search_query,
-            is_searching: app.is_searching,
-            scroll_offset: app.article_scroll_offset,
-        };
-        frame.render_widget(article_list, pane_chunks[1]);
-
-        // 3. Reader View Pane
-        let selected_article = current_articles.get(app.article_selected_idx);
-        let reader = ReaderView {
-            article: selected_article,
-            active_pane: app.active_pane,
-            theme,
-            scroll_offset: app.reader_scroll_offset,
-            is_zen_mode: false,
-        };
-        frame.render_widget(reader, pane_chunks[2]);
+        frame.render_widget(sidebar_view(app), pane_chunks[0]);
+        frame.render_widget(article_list_view(app), pane_chunks[1]);
+        render_reader(app, pane_chunks[2], false, frame);
     }
 
     // --- Render Bottom Status Bar ---
@@ -145,6 +84,7 @@ pub fn render_app(app: &App, frame: &mut Frame) {
         frame.render_widget(modal, area);
     } else if app.show_add_modal {
         let modal = AddFeedModal {
+            show_icons: app.config.show_icons,
             url_input: &app.modal_url_input,
             folder_input: &app.modal_folder_input,
             is_opml_mode: app.modal_is_opml_mode,
@@ -156,6 +96,7 @@ pub fn render_app(app: &App, frame: &mut Frame) {
         frame.render_widget(modal, area);
     } else if app.show_export_modal {
         let modal = ExportOpmlModal {
+            show_icons: app.config.show_icons,
             file_path_input: &app.modal_export_path,
             status_msg: app.modal_export_status.as_deref(),
             theme,
@@ -163,6 +104,7 @@ pub fn render_app(app: &App, frame: &mut Frame) {
         frame.render_widget(modal, area);
     } else if app.show_theme_modal {
         let modal = ThemePickerModal {
+            show_icons: app.config.show_icons,
             themes: &app.all_themes,
             selected_index: app.theme_picker_selected_idx,
             current_theme_name: &app.theme.config.name,
@@ -170,11 +112,15 @@ pub fn render_app(app: &App, frame: &mut Frame) {
         };
         frame.render_widget(modal, area);
     } else if app.show_help_modal {
-        let modal = HelpModal { theme };
+        let modal = HelpModal {
+            theme,
+            show_icons: app.config.show_icons,
+        };
         frame.render_widget(modal, area);
     } else if app.show_delete_modal {
         let (name, is_folder) = app.get_delete_target_info();
         let modal = ConfirmDeleteModal {
+            show_icons: app.config.show_icons,
             target_name: &name,
             is_folder,
             theme,
@@ -183,93 +129,109 @@ pub fn render_app(app: &App, frame: &mut Frame) {
     }
 }
 
-fn render_header_bar(app: &App, area: Rect, buf: &mut Buffer) {
-    let theme = &app.theme;
-    let bg_style = Style::default().bg(theme.status_bar_bg).fg(theme.fg);
-
-    for x in area.x..area.x + area.width {
-        buf.set_style(Rect::new(x, area.y, 1, 1), bg_style);
-    }
-
-    // App Brand / Title - RataRSS with no background badge so contrast is crisp and clean
-    let app_brand = Span::styled(
-        " 📰 RataRSS ",
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    // Sync status or Current View title
-    let sync_span = if app.is_syncing {
-        let spinner = get_spinner_frame(app.tick_count);
-        Span::styled(
-            format!("  {spinner} Fetching feeds... "),
-            Style::default().fg(theme.warning_fg).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            format!("  Viewing: {} ", app.current_view_title),
-            Style::default().fg(theme.fg_dim),
-        )
-    };
-
-    let left_line = Line::from(vec![app_brand, sync_span]);
-    buf.set_line(area.x, area.y, &left_line, area.width);
-
-    // Right quick shortcuts
-    let shortcuts = " [?] Help  [/] Config  [T] Themes  [a] Add  [r] Refresh  [f] Zen  [q] Quit ";
-    let short_len = shortcuts.len() as u16;
-    if area.width > short_len + 28 {
-        let right_x = area.x + area.width - short_len;
-        buf.set_string(
-            right_x,
-            area.y,
-            shortcuts,
-            Style::default().fg(theme.fg_subtle),
-        );
+fn sidebar_view(app: &App) -> SidebarView<'_> {
+    SidebarView {
+        items: &app.sidebar_items,
+        selected_index: app.sidebar_selected_idx,
+        active_pane: app.active_pane,
+        theme: &app.theme,
+        scroll_offset: app.sidebar_scroll_offset,
+        show_icons: app.config.show_icons,
+        padding: app.config.padding,
     }
 }
 
+fn article_list_view(app: &App) -> ArticleListView<'_> {
+    ArticleListView {
+        // A borrowed view of the article list; nothing is cloned per frame.
+        articles: app.visible_articles(),
+        selected_index: app.article_selected_idx,
+        active_pane: app.active_pane,
+        theme: &app.theme,
+        header_title: &app.current_view_title,
+        unread_count: app.current_view_unread_count,
+        search_query: &app.search_query,
+        is_searching: app.is_searching,
+        scroll_offset: app.article_scroll_offset,
+        show_icons: app.config.show_icons,
+        padding: app.config.padding,
+        spacing: app.config.article_spacing,
+    }
+}
+
+/// The reader needs its formatted text, which is cached in the app and only
+/// re-rendered when the article, pane width or theme changes.
+fn render_reader(app: &App, area: Rect, is_zen_mode: bool, frame: &mut Frame) {
+    let inner_width = ReaderView::inner_width(area, app.config.padding);
+    // Remember where the text landed so clicks can be mapped back onto links.
+    app.set_reader_text_area(ReaderView::text_area(area, app.config.padding));
+    app.with_formatted_article(inner_width, |formatted| {
+        let reader = ReaderView {
+            formatted,
+            active_pane: app.active_pane,
+            theme: &app.theme,
+            scroll_offset: app.reader_scroll_offset,
+            is_zen_mode,
+            show_icons: app.config.show_icons,
+            padding: app.config.padding,
+        };
+        frame.render_widget(reader, area);
+    });
+}
+
+/// The single chrome line: brand on the left, then sync/toast state, optional
+/// compact shortcut hints, and layout/theme info on the right.
 fn render_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
     let theme = &app.theme;
-    let bg_style = Style::default().bg(theme.status_bar_bg).fg(theme.status_bar_fg);
+    let icons = app.config.show_icons;
 
-    for x in area.x..area.x + area.width {
-        buf.set_style(Rect::new(x, area.y, 1, 1), bg_style);
-    }
-
-    // Left: Toast Message or Active Pane Info
-    let left_text = if let Some(ref msg) = app.toast_message {
-        format!(" 📢 {msg} ")
-    } else {
-        match app.active_pane {
-            ActivePane::Sidebar => " [1: Feeds] Tab to Articles • j/k navigate • Enter select • a Add • d Delete • / Config".to_string(),
-            ActivePane::ArticleList => " [2: Articles] Tab to Reader • j/k browse • m Read • s Star • Ctrl+F Search • / Config".to_string(),
-            ActivePane::Reader => " [3: Reader] j/k/Space Scroll • o Browser • y Copy • f Zen • / Config".to_string(),
-        }
-    };
-
-    buf.set_string(
-        area.x,
-        area.y,
-        &left_text,
-        if app.toast_message.is_some() {
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.status_bar_fg)
-        },
+    // One call rather than one per cell.
+    buf.set_style(
+        area,
+        Style::default().bg(theme.status_bar_bg).fg(theme.status_bar_fg),
     );
 
-    // Right: Pane Split info / Theme name
+    let brand = if icons { " 📰 RataRSS " } else { " RataRSS " };
+    let mut spans = vec![Span::styled(
+        brand,
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+    )];
+
+    // Transient state (toast or sync) takes the slot right of the brand; the
+    // pane-name text that used to sit here is gone.
+    if let Some(ref msg) = app.toast_message {
+        spans.push(Span::styled(
+            format!(" {msg} "),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    } else if app.is_syncing {
+        let spinner = get_spinner_frame(app.tick_count);
+        spans.push(Span::styled(
+            format!(" {spinner} syncing "),
+            Style::default().fg(theme.warning_fg).add_modifier(Modifier::BOLD),
+        ));
+    } else if app.config.show_help_hints {
+        spans.push(Span::styled(
+            format!(" {HELP_HINTS} "),
+            Style::default().fg(theme.fg_subtle),
+        ));
+    }
+
+    let left_line = Line::from(spans);
+    buf.set_line(area.x, area.y, &left_line, area.width);
+
+    // Right: layout split and theme name, dropped entirely when the terminal
+    // is too narrow to hold it without colliding with the brand.
     let right_text = format!(
-        " Split: {}%/{}%/{}%  Theme: {} ",
+        " {}/{}/{}  {} ",
         app.sidebar_width_percent,
         app.article_width_percent,
         app.reader_width_percent,
         theme.config.name
     );
-    let right_len = right_text.len() as u16;
-    if area.width > right_len + 40 {
+    let right_len = unicode_width::UnicodeWidthStr::width(right_text.as_str()) as u16;
+    let left_len = left_line.width() as u16;
+    if area.width > right_len + left_len + 2 {
         let right_x = area.x + area.width - right_len;
         buf.set_string(
             right_x,

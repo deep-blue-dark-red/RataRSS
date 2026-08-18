@@ -48,6 +48,38 @@ pub struct Article {
     pub created_at: DateTime<Utc>,
 }
 
+/// A borrowed view of the article list as it is currently displayed: the full
+/// list, plus an optional index of the rows a search matched.
+///
+/// The list pane used to receive a freshly cloned `Vec<Article>` every frame,
+/// which copied every title, summary and body in the view. This carries two
+/// pointers instead.
+#[derive(Clone, Copy)]
+pub struct ArticleSlice<'a> {
+    pub all: &'a [Article],
+    pub filtered: Option<&'a [u32]>,
+}
+
+impl<'a> ArticleSlice<'a> {
+    pub fn len(&self) -> usize {
+        match self.filtered {
+            Some(idx) => idx.len(),
+            None => self.all.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, pos: usize) -> Option<&'a Article> {
+        match self.filtered {
+            Some(idx) => idx.get(pos).and_then(|i| self.all.get(*i as usize)),
+            None => self.all.get(pos),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SmartFeedKind {
     Today,

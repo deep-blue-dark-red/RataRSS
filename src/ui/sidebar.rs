@@ -14,6 +14,8 @@ pub struct SidebarView<'a> {
     pub active_pane: ActivePane,
     pub theme: &'a Theme,
     pub scroll_offset: usize,
+    pub show_icons: bool,
+    pub padding: u16,
 }
 
 impl<'a> Widget for SidebarView<'a> {
@@ -30,7 +32,7 @@ impl<'a> Widget for SidebarView<'a> {
             .border_style(border_style)
             .style(Style::default().bg(self.theme.sidebar_bg))
             .title(Span::styled(
-                " 🗂 Feeds & Folders ",
+                if self.show_icons { " 🗂 Feeds " } else { " Feeds " },
                 if is_focused {
                     Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD)
                 } else {
@@ -44,6 +46,12 @@ impl<'a> Widget for SidebarView<'a> {
         if inner_area.height == 0 || inner_area.width == 0 {
             return;
         }
+
+        // Content is inset by the configured padding; row backgrounds still
+        // span the full pane so selection highlights stay flush.
+        let pad = self.padding.min(inner_area.width.saturating_sub(1) / 2);
+        let text_x = inner_area.x + pad;
+        let text_width = inner_area.width.saturating_sub(pad * 2);
 
         let visible_height = inner_area.height as usize;
         let mut start_idx = self.scroll_offset;
@@ -75,10 +83,8 @@ impl<'a> Widget for SidebarView<'a> {
                 Style::default().bg(self.theme.sidebar_bg).fg(self.theme.fg)
             };
 
-            // Fill row background
-            for col in 0..inner_area.width {
-                buf.set_style(Rect::new(inner_area.x + col, y, 1, 1), row_bg_style);
-            }
+            // Fill the row in one call rather than one per cell.
+            buf.set_style(Rect::new(inner_area.x, y, inner_area.width, 1), row_bg_style);
 
             match item {
                 SidebarItem::SmartHeader => {
@@ -89,10 +95,9 @@ impl<'a> Widget for SidebarView<'a> {
                             .fg(self.theme.sidebar_header_fg)
                             .add_modifier(Modifier::BOLD),
                     )]);
-                    buf.set_line(inner_area.x, y, &line, inner_area.width);
+                    buf.set_line(text_x, y, &line, text_width);
                 }
                 SidebarItem::Smart(kind, count) => {
-                    let icon = kind.icon();
                     let title = kind.title();
                     let badge_text = if *count > 0 {
                         format!("{count}")
@@ -101,7 +106,11 @@ impl<'a> Widget for SidebarView<'a> {
                     };
 
                     let prefix = if is_selected { " ▸ " } else { "   " };
-                    let left_text = format!("{prefix}{icon}  {title}");
+                    let left_text = if self.show_icons {
+                        format!("{prefix}{}  {title}", kind.icon())
+                    } else {
+                        format!("{prefix}{title}")
+                    };
                     let left_len = unicode_width::UnicodeWidthStr::width(left_text.as_str());
 
                     let line_left = Span::styled(
@@ -113,14 +122,14 @@ impl<'a> Widget for SidebarView<'a> {
                         },
                     );
 
-                    buf.set_span(inner_area.x, y, &line_left, inner_area.width);
+                    buf.set_span(text_x, y, &line_left, text_width);
 
                     if !badge_text.is_empty() {
                         let badge = Badge::new(&badge_text, self.theme, is_selected);
                         let badge_span = badge.to_span();
                         let badge_width = badge_text.len() + 2;
-                        if (inner_area.width as usize) > left_len + badge_width + 1 {
-                            let badge_x = inner_area.x + inner_area.width - badge_width as u16 - 1;
+                        if (text_width as usize) > left_len + badge_width + 1 {
+                            let badge_x = text_x + text_width - badge_width as u16;
                             buf.set_span(badge_x, y, &badge_span, badge_width as u16);
                         }
                     }
@@ -132,9 +141,13 @@ impl<'a> Widget for SidebarView<'a> {
                     feed_count: _,
                 } => {
                     let arrow = if *is_expanded { "▾" } else { "▸" };
-                    let icon = if *is_expanded { "📂" } else { "📁" };
                     let prefix = if is_selected { " ▸ " } else { "   " };
-                    let folder_title = format!("{prefix}{arrow} {icon} {name}");
+                    let folder_title = if self.show_icons {
+                        let icon = if *is_expanded { "📂" } else { "📁" };
+                        format!("{prefix}{arrow} {icon} {name}")
+                    } else {
+                        format!("{prefix}{arrow} {name}")
+                    };
                     let left_len = unicode_width::UnicodeWidthStr::width(folder_title.as_str());
 
                     let span = Span::styled(
@@ -149,7 +162,7 @@ impl<'a> Widget for SidebarView<'a> {
                                 .add_modifier(Modifier::BOLD)
                         },
                     );
-                    buf.set_span(inner_area.x, y, &span, inner_area.width);
+                    buf.set_span(text_x, y, &span, text_width);
 
                     let badge_text = if *unread_count > 0 {
                         format!("{unread_count}")
@@ -161,8 +174,8 @@ impl<'a> Widget for SidebarView<'a> {
                         let badge = Badge::new(&badge_text, self.theme, is_selected);
                         let badge_span = badge.to_span();
                         let badge_width = badge_text.len() + 2;
-                        if (inner_area.width as usize) > left_len + badge_width + 1 {
-                            let badge_x = inner_area.x + inner_area.width - badge_width as u16 - 1;
+                        if (text_width as usize) > left_len + badge_width + 1 {
+                            let badge_x = text_x + text_width - badge_width as u16;
                             buf.set_span(badge_x, y, &badge_span, badge_width as u16);
                         }
                     }
@@ -177,14 +190,14 @@ impl<'a> Widget for SidebarView<'a> {
                     let indent = if folder.is_some() { "      " } else { "   " };
                     let prefix = if is_selected { "▸" } else { " " };
                     let status_icon = if *has_error {
-                        "⚠️"
+                        if self.show_icons { "⚠️" } else { "!" }
                     } else if *unread_count > 0 {
                         "•"
                     } else {
                         " "
                     };
 
-                    let title_avail_width = inner_area.width.saturating_sub(12) as usize;
+                    let title_avail_width = text_width.saturating_sub(12) as usize;
                     let display_title = truncate_string(title, title_avail_width);
 
                     let feed_text = format!("{prefix}{indent}{status_icon} {display_title}");
@@ -204,15 +217,15 @@ impl<'a> Widget for SidebarView<'a> {
                             Style::default().fg(self.theme.fg_dim)
                         },
                     );
-                    buf.set_span(inner_area.x, y, &span, inner_area.width);
+                    buf.set_span(text_x, y, &span, text_width);
 
                     if *unread_count > 0 {
                         let badge_text = format!("{unread_count}");
                         let badge = Badge::new(&badge_text, self.theme, is_selected);
                         let badge_span = badge.to_span();
                         let badge_width = badge_text.len() + 2;
-                        if (inner_area.width as usize) > left_len + badge_width + 1 {
-                            let badge_x = inner_area.x + inner_area.width - badge_width as u16 - 1;
+                        if (text_width as usize) > left_len + badge_width + 1 {
+                            let badge_x = text_x + text_width - badge_width as u16;
                             buf.set_span(badge_x, y, &badge_span, badge_width as u16);
                         }
                     }

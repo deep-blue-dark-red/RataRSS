@@ -146,23 +146,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    // Only process Press events (avoid double triggers on Windows/macOS)
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        app.handle_key_event(key);
+            // Drain everything the terminal has already queued before drawing.
+            // Holding j/k or spinning the scroll wheel delivers events far
+            // faster than a frame takes, and redrawing once per event makes the
+            // UI lag behind the input; applying the whole burst and drawing the
+            // final state once keeps scrolling attached to the key.
+            loop {
+                match event::read()? {
+                    Event::Key(key) => {
+                        // Only process Press events (avoid double triggers on Windows/macOS)
+                        if key.kind == crossterm::event::KeyEventKind::Press {
+                            app.handle_key_event(key);
+                            needs_redraw = true;
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        let size = terminal.size().unwrap_or_default();
+                        app.handle_mouse_event(mouse, size.width, size.height);
                         needs_redraw = true;
                     }
+                    Event::Resize(_, _) => {
+                        needs_redraw = true;
+                    }
+                    _ => {}
                 }
-                Event::Mouse(mouse) => {
-                    let size = terminal.size().unwrap_or_default();
-                    app.handle_mouse_event(mouse, size.width, size.height);
-                    needs_redraw = true;
+
+                if app.should_quit || !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                Event::Resize(_, _) => {
-                    needs_redraw = true;
-                }
-                _ => {}
             }
         }
 

@@ -80,7 +80,7 @@ mod tests {
             created_at: Utc::now(),
         };
 
-        let formatted = render_article_to_text(&article, &theme, 80);
+        let formatted = render_article_to_text(&article, None, &theme, 80);
         assert!(formatted.total_lines > 0);
         assert!(formatted.links.contains(&"https://example.com/rust".to_string()));
     }
@@ -255,7 +255,10 @@ mod tests {
         let filter = CurrentFilter::Smart(ratarss::model::SmartFeedKind::AllArticles);
         let articles = db.get_articles_by_filter(&filter).expect("get articles failed");
         assert!(!articles.is_empty());
-        assert!(articles[0].content.is_some());
+        // The list query deliberately leaves bodies behind; they are fetched
+        // one at a time for the reader.
+        assert!(articles[0].content.is_none());
+        assert!(db.get_article_body(&articles[0].id).is_some());
     }
 
     /// A database written before compression holds `summary`/`content` as TEXT.
@@ -318,6 +321,294 @@ mod tests {
             .expect("all articles");
         let legacy = listed.iter().find(|a| a.id == "legacy-1").unwrap();
         assert_eq!(legacy.summary.as_deref(), Some("a plain TEXT summary"));
-        assert_eq!(legacy.content.as_deref(), Some("a plain TEXT body"));
+        assert_eq!(
+            db.get_article_body("legacy-1").as_deref(),
+            Some("a plain TEXT body"),
+            "the reader must still decode a legacy TEXT body"
+        );
+    }
+}
+
+/// Rendering smoke tests.
+///
+/// The chrome rework changed pane geometry (no top bar, configurable padding)
+/// and replaced per-cell background fills with whole-rect ones. Both are
+/// arithmetic on `Rect`s, where an off-by-one panics inside the buffer rather
+/// than merely looking wrong, so draw the panes at awkward sizes.
+#[cfg(test)]
+mod render_tests {
+    use chrono::Utc;
+    use ratarss::model::{ActivePane, Article, ArticleSlice, SidebarItem, SmartFeedKind};
+    use ratarss::theme::Theme;
+    use ratarss::ui::article_list::ArticleListView;
+    use ratarss::ui::sidebar::SidebarView;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    fn article(n: usize) -> Article {
+        Article {
+            id: format!("a{n}"),
+            feed_id: "f".to_string(),
+            feed_title: "A Rather Long Feed Title".to_string(),
+            title: "An article title that is long enough to need truncating".to_string(),
+            author: None,
+            summary: Some("Summary text that also runs past the pane edge".to_string()),
+            content: None,
+            url: "https://example.com".to_string(),
+            published: Some(Utc::now()),
+            read: n % 2 == 0,
+            starred: n % 3 == 0,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn panes_render_at_any_width_and_padding() {
+        let theme = Theme::ratarss_dark();
+        let articles: Vec<Article> = (0..12).map(article).collect();
+        let items = vec![
+            SidebarItem::SmartHeader,
+            SidebarItem::Smart(SmartFeedKind::Today, 12808),
+            SidebarItem::FolderHeader {
+                name: "Substack".to_string(),
+                is_expanded: true,
+                unread_count: 457,
+                feed_count: 9,
+            },
+            SidebarItem::Feed {
+                feed_id: "f".to_string(),
+                title: "A feed with a name too long for a narrow pane".to_string(),
+                folder: Some("Substack".to_string()),
+                unread_count: 20,
+                has_error: true,
+            },
+        ];
+
+        for width in [8u16, 12, 20, 40, 120] {
+            for padding in [0u16, 1, 3, 6] {
+                for show_icons in [true, false] {
+                    let area = Rect::new(0, 0, width, 14);
+                    let mut buf = Buffer::empty(area);
+
+                    SidebarView {
+                        items: &items,
+                        selected_index: 1,
+                        active_pane: ActivePane::Sidebar,
+                        theme: &theme,
+                        scroll_offset: 0,
+                        show_icons,
+                        padding,
+                    }
+                    .render(area, &mut buf);
+
+                    ArticleListView {
+                        articles: ArticleSlice {
+                            all: &articles,
+                            filtered: None,
+                        },
+                        selected_index: 3,
+                        active_pane: ActivePane::ArticleList,
+                        theme: &theme,
+                        header_title: "All Articles",
+                        unread_count: 12808,
+                        search_query: "query",
+                        is_searching: true,
+                        scroll_offset: 0,
+                        show_icons,
+                        padding,
+                        spacing: padding % 4,
+                    }
+                    .render(area, &mut buf);
+                }
+            }
+        }
+    }
+
+    /// A `<` immediately followed by a multi-byte character used to panic the
+    /// block-tag normalizer, which compared a byte-length slice of the input
+    /// against each tag. Real feeds are full of curly quotes right after tags.
+    #[test]
+    fn html_with_multibyte_characters_after_tags_renders() {
+        let theme = Theme::ratarss_dark();
+        let mut a = article(1);
+        a.title = "Curly ’quotes’".to_string();
+
+        for html in [
+            "<p>It’s fine</p>",
+            "<’>",
+            "<b>—</b><br/>naïve café ’’’",
+            "<blockquote>“Quoted”</blockquote><li>é</li>",
+        ] {
+            let formatted = ratarss::reader::render_article_to_text(&a, Some(html), &theme, 40);
+            assert!(formatted.total_lines > 0, "{html:?} produced nothing");
+        }
+    }
+
+    /// Links in the body must survive wrapping as their own spans, and the
+    /// recorded hit must point at the columns the anchor text was actually
+    /// drawn in — that mapping is what makes them clickable.
+    #[test]
+    fn body_links_are_styled_and_hit_testable() {
+        let theme = Theme::ratarss_dark();
+        let a = article(1);
+        let html = "<p>Go read <a href=\"https://example.com/story\">this fine story</a> today \
+                    and then <a href=\"https://example.com/other\">another</a>.</p>";
+
+        let formatted = ratarss::reader::render_article_to_text(&a, Some(html), &theme, 60);
+
+        assert!(formatted.links.iter().any(|l| l == "https://example.com/story"));
+        assert!(formatted.links.iter().any(|l| l == "https://example.com/other"));
+
+        // Every hit must land on the text it claims to cover.
+        assert!(!formatted.hits.is_empty());
+        for hit in &formatted.hits {
+            let url = formatted.links[hit.link].clone();
+            let found = formatted
+                .link_at(hit.line, hit.start_col)
+                .expect("hit start must resolve to its link");
+            assert_eq!(found, url);
+            assert_eq!(formatted.link_at(hit.line, hit.end_col - 1).unwrap(), url);
+            // The columns must be inside the line that was drawn.
+            let line_width = formatted.lines[hit.line].width() as u16;
+            assert!(
+                hit.end_col <= line_width,
+                "hit {:?} runs past its {line_width}-wide line",
+                hit
+            );
+        }
+
+        // A column outside every hit is not a link.
+        let body_hit = formatted.hits.last().unwrap();
+        assert!(formatted.link_at(body_hit.line, body_hit.end_col).is_none());
+    }
+
+    /// The header URL is clickable too, and a link split across a wrap still
+    /// resolves on both of its lines.
+    #[test]
+    fn header_url_and_wrapped_links_resolve() {
+        let theme = Theme::ratarss_dark();
+        let a = article(1);
+        let long = "<p><a href=\"https://example.com/x\">a very long anchor label that will \
+                    certainly need to wrap across more than one line of the pane</a></p>";
+
+        let formatted = ratarss::reader::render_article_to_text(&a, Some(long), &theme, 40);
+
+        // article(1).url is https://example.com
+        assert!(formatted.links.iter().any(|l| l == "https://example.com"));
+        let header = formatted.hits.first().unwrap();
+        assert_eq!(
+            formatted.link_at(header.line, header.start_col).unwrap(),
+            "https://example.com"
+        );
+
+        let wrapped: Vec<_> = formatted
+            .hits
+            .iter()
+            .filter(|h| formatted.links[h.link] == "https://example.com/x")
+            .collect();
+        assert!(wrapped.len() > 1, "the long anchor should span several lines");
+    }
+
+    /// The list must run to the bottom edge of its pane. Card height rarely
+    /// divides the available rows, and skipping the card that does not fully
+    /// fit left a visible dead band above the border; the last card is drawn
+    /// clipped instead.
+    #[test]
+    fn list_fills_to_the_bottom_edge() {
+        let theme = Theme::ratarss_dark();
+        let articles: Vec<Article> = (0..40).map(article).collect();
+
+        for height in 8u16..24 {
+            for spacing in [0u16, 1, 2] {
+                let area = Rect::new(0, 0, 50, height);
+                let mut buf = Buffer::empty(area);
+                ArticleListView {
+                    articles: ArticleSlice { all: &articles, filtered: None },
+                    selected_index: 0,
+                    active_pane: ActivePane::ArticleList,
+                    theme: &theme,
+                    header_title: "All",
+                    unread_count: 3,
+                    search_query: "",
+                    is_searching: false,
+                    scroll_offset: 0,
+                    show_icons: true,
+                    padding: 1,
+                    spacing,
+                }
+                .render(area, &mut buf);
+
+                // Count blank rows above the bottom border. Anything beyond a
+                // single inter-card gap is the dead band this fixes.
+                let mut blank = 0u16;
+                for y in (1..height - 1).rev() {
+                    let row: String = (1..area.width - 1)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect();
+                    if row.trim().is_empty() {
+                        blank += 1;
+                    } else {
+                        break;
+                    }
+                }
+                assert!(
+                    blank <= spacing,
+                    "height {height} spacing {spacing}: {blank} dead rows at the bottom"
+                );
+            }
+        }
+    }
+
+    /// Half-row spacing cannot exist in a cell grid, so it is approximated by
+    /// alternating gaps. The layout must average out, stay monotonic, and agree
+    /// with the click hit-test that maps a row back to a card.
+    #[test]
+    fn half_row_spacing_distributes_and_round_trips() {
+        use ratarss::ui::article_list::{card_at_row, card_top, spacing_label, CARD_HEIGHT};
+
+        assert_eq!(spacing_label(0), "0");
+        assert_eq!(spacing_label(1), "0.5");
+        assert_eq!(spacing_label(3), "1.5");
+
+        // Half-row spacing: gaps alternate 0, 1, 0, 1 ...
+        let gaps: Vec<u16> = (0..6)
+            .map(|k| card_top(k + 1, 1) - card_top(k, 1) - CARD_HEIGHT)
+            .collect();
+        assert_eq!(gaps, vec![0, 1, 0, 1, 0, 1]);
+
+        // Flush and whole-row spacing stay exact.
+        assert_eq!(card_top(4, 0), 12);
+        assert_eq!(card_top(4, 2), 16);
+
+        for halves in 0..=6u16 {
+            // Monotonic, and every row inside a card maps back to that card.
+            for k in 0..12usize {
+                let top = card_top(k, halves);
+                assert!(k == 0 || top > card_top(k - 1, halves));
+                for row in top..top + CARD_HEIGHT {
+                    assert_eq!(
+                        card_at_row(row, halves),
+                        k,
+                        "halves {halves}: row {row} should hit card {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn article_slice_indexes_through_search_matches() {
+        let articles: Vec<Article> = (0..5).map(article).collect();
+        let filtered = [1u32, 4];
+        let slice = ArticleSlice {
+            all: &articles,
+            filtered: Some(&filtered),
+        };
+
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice.get(0).unwrap().id, "a1");
+        assert_eq!(slice.get(1).unwrap().id, "a4");
+        assert!(slice.get(2).is_none());
     }
 }

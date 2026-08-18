@@ -202,8 +202,27 @@ pub struct AppConfig {
     pub show_icons: bool,
     pub wrap_article_text: bool,
 
+    /// Horizontal padding inside every pane, in cells (0-6).
+    #[serde(default = "default_padding")]
+    pub padding: u16,
+
+    /// Gap between article cards, in *half* rows (0-6). 0 keeps the cards
+    /// flush; 1 averages half a row by blanking every second gap.
+    #[serde(default)]
+    pub article_spacing: u16,
+
+    /// Whether the compact shortcut hints are drawn in the status bar.
+    /// Off by default — the status line stays clean until asked. Toggled live
+    /// with `??`, or from the settings menu.
+    #[serde(default)]
+    pub show_help_hints: bool,
+
     #[serde(default)]
     pub keybindings: KeyBindingsConfig,
+}
+
+fn default_padding() -> u16 {
+    1
 }
 
 impl Default for AppConfig {
@@ -220,6 +239,9 @@ impl Default for AppConfig {
             max_articles_per_feed: 200,
             show_icons: true,
             wrap_article_text: true,
+            padding: default_padding(),
+            article_spacing: 0,
+            show_help_hints: false,
             keybindings: KeyBindingsConfig::default(),
         }
     }

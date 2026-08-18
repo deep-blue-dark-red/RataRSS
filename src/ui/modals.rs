@@ -27,6 +27,7 @@ impl ModalHelper {
 }
 
 pub struct AddFeedModal<'a> {
+    pub show_icons: bool,
     pub url_input: &'a str,
     pub folder_input: &'a str,
     pub is_opml_mode: bool,
@@ -42,7 +43,7 @@ impl<'a> Widget for AddFeedModal<'a> {
         Clear.render(popup_area, buf);
 
         let title = if self.is_opml_mode {
-            " 📥 Import Subscriptions (OPML) "
+            if self.show_icons { " 📥 Import Subscriptions (OPML) " } else { " Import Subscriptions (OPML) " }
         } else {
             " ➕ Add RSS Feed / Website "
         };
@@ -90,9 +91,7 @@ impl<'a> Widget for AddFeedModal<'a> {
         };
 
         let field1_width = inner.width.saturating_sub(4);
-        for x in 0..field1_width {
-            buf.set_style(Rect::new(inner.x + 2 + x, y, 1, 1), field1_style);
-        }
+        buf.set_style(Rect::new(inner.x + 2, y, field1_width, 1), field1_style);
         let input1_text = format!(" {}{}", self.url_input, if self.focused_field == 0 { "█" } else { "" });
         buf.set_string(inner.x + 2, y, &input1_text, field1_style);
         y += 2;
@@ -108,9 +107,7 @@ impl<'a> Widget for AddFeedModal<'a> {
                 Style::default().bg(self.theme.sidebar_bg).fg(self.theme.fg)
             };
 
-            for x in 0..field1_width {
-                buf.set_style(Rect::new(inner.x + 2 + x, y, 1, 1), field2_style);
-            }
+            buf.set_style(Rect::new(inner.x + 2, y, field1_width, 1), field2_style);
             let input2_text = format!(" {}{}", self.folder_input, if self.focused_field == 1 { "█" } else { "" });
             buf.set_string(inner.x + 2, y, &input2_text, field2_style);
             y += 2;
@@ -146,6 +143,7 @@ impl<'a> Widget for AddFeedModal<'a> {
 }
 
 pub struct ExportOpmlModal<'a> {
+    pub show_icons: bool,
     pub file_path_input: &'a str,
     pub status_msg: Option<&'a str>,
     pub theme: &'a Theme,
@@ -161,7 +159,7 @@ impl<'a> Widget for ExportOpmlModal<'a> {
             .border_style(Style::default().fg(self.theme.modal_border).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(self.theme.modal_bg))
             .title(Span::styled(
-                " 📤 Export Feeds to OPML ",
+                if self.show_icons { " 📤 Export Feeds to OPML " } else { " Export Feeds to OPML " },
                 Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
             ));
 
@@ -177,9 +175,7 @@ impl<'a> Widget for ExportOpmlModal<'a> {
 
         let field_style = Style::default().bg(self.theme.selection_bg).fg(self.theme.selection_fg);
         let width = inner.width.saturating_sub(4);
-        for x in 0..width {
-            buf.set_style(Rect::new(inner.x + 2 + x, inner.y + 2, 1, 1), field_style);
-        }
+        buf.set_style(Rect::new(inner.x + 2, inner.y + 2, width, 1), field_style);
         let text = format!(" {}█", self.file_path_input);
         buf.set_string(inner.x + 2, inner.y + 2, &text, field_style);
 
@@ -198,6 +194,7 @@ impl<'a> Widget for ExportOpmlModal<'a> {
 }
 
 pub struct ThemePickerModal<'a> {
+    pub show_icons: bool,
     pub themes: &'a [Theme],
     pub selected_index: usize,
     pub current_theme_name: &'a str,
@@ -214,7 +211,11 @@ impl<'a> Widget for ThemePickerModal<'a> {
             .border_style(Style::default().fg(self.theme.modal_border).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(self.theme.modal_bg))
             .title(Span::styled(
-                format!(" 🎨 Select Theme ({} available) ", self.themes.len()),
+                if self.show_icons {
+                    format!(" 🎨 Select Theme ({} available) ", self.themes.len())
+                } else {
+                    format!(" Select Theme ({} available) ", self.themes.len())
+                },
                 Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
             ));
 
@@ -255,9 +256,7 @@ impl<'a> Widget for ThemePickerModal<'a> {
                     Style::default().bg(self.theme.modal_bg).fg(self.theme.fg)
                 };
 
-                for x in 0..inner.width {
-                    buf.set_style(Rect::new(inner.x + x, y, 1, 1), row_style);
-                }
+                buf.set_style(Rect::new(inner.x, y, inner.width, 1), row_style);
 
                 let active_marker = if is_active { "✔ " } else { "  " };
                 let cursor = if is_selected { "▸ " } else { "  " };
@@ -328,7 +327,7 @@ impl<'a> Widget for ConfigMenuModal<'a> {
 
 impl<'a> ConfigMenuModal<'a> {
     fn render_main_config(&self, area: Rect, buf: &mut Buffer) {
-        let height_lines = 15;
+        let height_lines = 17;
         let popup_area = ModalHelper::bottom_sheet_rect(88, height_lines, area);
         Clear.render(popup_area, buf);
 
@@ -337,20 +336,26 @@ impl<'a> ConfigMenuModal<'a> {
             .border_style(Style::default().fg(self.theme.modal_border).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(self.theme.modal_bg))
             .title(Span::styled(
-                " ⚙️  RataRSS Configuration Menu (Press / to toggle) ",
+                if self.config.show_icons {
+                    " ⚙️  Settings (/ to close) "
+                } else {
+                    " Settings (/ to close) "
+                },
                 Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
             ));
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
+        // Labels carry their icon only when icons are enabled.
+        let icons = self.config.show_icons;
         let items = [
             (
-                "🎨 Theme",
+                if icons { "🎨 Theme" } else { "Theme" },
                 format!("◀  {}  ▶ (Enter / ← / → to change)", self.config.theme),
             ),
             (
-                "🔄 Auto-Refresh on Startup",
+                if icons { "🔄 Auto-Refresh on Startup" } else { "Auto-Refresh on Startup" },
                 if self.config.auto_refresh_on_startup {
                     "[✓] Enabled (Space / Enter to toggle)".to_string()
                 } else {
@@ -358,11 +363,11 @@ impl<'a> ConfigMenuModal<'a> {
                 },
             ),
             (
-                "⏱️  Refresh Interval",
+                if icons { "⏱️  Refresh Interval" } else { "Refresh Interval" },
                 format!("◀  {} minutes  ▶ (← / → to change)", self.config.refresh_interval_minutes),
             ),
             (
-                "📖 Mark Read on Open",
+                if icons { "📖 Mark Read on Open" } else { "Mark Read on Open" },
                 if self.config.mark_read_on_open {
                     "[✓] Enabled (Space / Enter to toggle)".to_string()
                 } else {
@@ -370,7 +375,7 @@ impl<'a> ConfigMenuModal<'a> {
                 },
             ),
             (
-                "🔤 Wrap Article Text",
+                if icons { "🔤 Wrap Article Text" } else { "Wrap Article Text" },
                 if self.config.wrap_article_text {
                     "[✓] Enabled (Space / Enter to toggle)".to_string()
                 } else {
@@ -378,7 +383,7 @@ impl<'a> ConfigMenuModal<'a> {
                 },
             ),
             (
-                "🖼️  Show Badges & Icons",
+                if icons { "🖼️  Show Badges & Icons" } else { "Show Badges & Icons" },
                 if self.config.show_icons {
                     "[✓] Enabled (Space / Enter to toggle)".to_string()
                 } else {
@@ -386,14 +391,33 @@ impl<'a> ConfigMenuModal<'a> {
                 },
             ),
             (
-                "📏 Layout Pane Ratios",
+                if icons { "📐 Content Padding" } else { "Content Padding" },
+                format!("◀  {} cell(s)  ▶ (← / → to change)", self.config.padding),
+            ),
+            (
+                if icons { "↕️  Article Spacing" } else { "Article Spacing" },
+                format!(
+                    "◀  {} row(s)  ▶ (← / → in half-row steps)",
+                    crate::ui::article_list::spacing_label(self.config.article_spacing)
+                ),
+            ),
+            (
+                if icons { "❔ Shortcut Hints in Status Bar" } else { "Shortcut Hints in Status Bar" },
+                if self.config.show_help_hints {
+                    "[✓] Shown (Space / Enter, or ?? anywhere)".to_string()
+                } else {
+                    "[ ] Hidden (Space / Enter, or ?? anywhere)".to_string()
+                },
+            ),
+            (
+                if icons { "📏 Layout Pane Ratios" } else { "Layout Pane Ratios" },
                 format!(
                     "Sidebar: {}%  |  Articles: {}%  |  Reader: {}%  (← / → adjust, = reset)",
                     self.config.sidebar_ratio, self.config.article_list_ratio, self.config.reader_ratio
                 ),
             ),
             (
-                "⌨️  Custom Keybindings",
+                if icons { "⌨️  Custom Keybindings" } else { "Custom Keybindings" },
                 "View & configure shortcuts (Press Enter to open)".to_string(),
             ),
         ];
@@ -413,9 +437,7 @@ impl<'a> ConfigMenuModal<'a> {
                 Style::default().bg(self.theme.modal_bg).fg(self.theme.fg)
             };
 
-            for x in 0..inner.width {
-                buf.set_style(Rect::new(inner.x + x, y, 1, 1), row_style);
-            }
+            buf.set_style(Rect::new(inner.x, y, inner.width, 1), row_style);
 
             let cursor = if is_selected { " ▸ " } else { "   " };
             let label_text = format!("{cursor}{:<28}", label);
@@ -450,7 +472,11 @@ impl<'a> ConfigMenuModal<'a> {
             .border_style(Style::default().fg(self.theme.modal_border).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(self.theme.modal_bg))
             .title(Span::styled(
-                " ⌨️  Configured Keybindings (Saved in config.toml) ",
+                if self.config.show_icons {
+                    " ⌨️  Keybindings (saved in config.toml) "
+                } else {
+                    " Keybindings (saved in config.toml) "
+                },
                 Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
             ));
 
@@ -519,9 +545,7 @@ impl<'a> ConfigMenuModal<'a> {
                 Style::default().bg(self.theme.modal_bg).fg(self.theme.fg)
             };
 
-            for x in 0..inner.width {
-                buf.set_style(Rect::new(inner.x + x, y, 1, 1), row_style);
-            }
+            buf.set_style(Rect::new(inner.x, y, inner.width, 1), row_style);
 
             let cursor = if is_selected { "▸ " } else { "  " };
             buf.set_string(inner.x + 1, y, &format!("{cursor}{:<30}", action), row_style);
@@ -543,6 +567,7 @@ impl<'a> ConfigMenuModal<'a> {
 
 pub struct HelpModal<'a> {
     pub theme: &'a Theme,
+    pub show_icons: bool,
 }
 
 impl<'a> Widget for HelpModal<'a> {
@@ -555,7 +580,11 @@ impl<'a> Widget for HelpModal<'a> {
             .border_style(Style::default().fg(self.theme.modal_border).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(self.theme.modal_bg))
             .title(Span::styled(
-                " ⌨️  RataRSS Keyboard Reference & Cheatsheet ",
+                if self.show_icons {
+                    " ⌨️  RataRSS Shortcuts "
+                } else {
+                    " RataRSS Shortcuts "
+                },
                 Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
             ));
 
@@ -587,7 +616,8 @@ impl<'a> Widget for HelpModal<'a> {
                 ("r / R", "Refresh selected feed / Refresh all feeds"),
                 ("d", "Delete selected feed or folder"),
                 ("f or z", "Toggle Fullscreen / Zen mode for active pane"),
-                ("? / F1", "Toggle this Help modal"),
+                ("? / F1", "Open this reference"),
+                ("??", "Toggle the compact shortcut hints in the status bar"),
                 ("q / Ctrl+C", "Quit RataRSS"),
             ]),
         ];
@@ -636,13 +666,14 @@ impl<'a> Widget for HelpModal<'a> {
         buf.set_string(
             inner.x + 2,
             bottom_y,
-            " Press [Esc] or [?] to close ",
+            " [Esc] close   [?] close and toggle status-bar hints ",
             Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
         );
     }
 }
 
 pub struct ConfirmDeleteModal<'a> {
+    pub show_icons: bool,
     pub target_name: &'a str,
     pub is_folder: bool,
     pub theme: &'a Theme,
@@ -658,7 +689,7 @@ impl<'a> Widget for ConfirmDeleteModal<'a> {
             .border_style(Style::default().fg(self.theme.error_fg).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(self.theme.modal_bg))
             .title(Span::styled(
-                " ⚠️ Confirm Deletion ",
+                if self.show_icons { " ⚠️ Confirm Deletion " } else { " Confirm Deletion " },
                 Style::default().fg(self.theme.error_fg).add_modifier(Modifier::BOLD),
             ));
 
