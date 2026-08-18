@@ -1,6 +1,6 @@
 [package]
 name = "ratarss"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["mcp"]
 description = "A beautiful, minimal, themable, and customizable RSS reader in Ratatui in Rust resembling NetNewsWire"

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "ratarss",
-    version = "0.1.0",
+    version = "1.0.0",
     about = "A fast, beautiful, and customizable TUI RSS reader in Rust"
 )]
 struct Cli {
