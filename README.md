@@ -20,7 +20,7 @@ any terminal, and never makes you wait.
 
 ---
 
-## Why it feels fast
+## Its Fast
 
 Every number below was measured on a real library: **13,098 articles across 474
 feeds**, a 21 MB database, on an ordinary laptop.
@@ -55,7 +55,7 @@ key instead of trailing a frame behind it.
 
 ---
 
-## Storage that forgets nothing
+## It Remembers
 
 Your library is an embedded SQLite database in WAL mode. **Nothing is ever deleted
 unless you delete it.** No article cap, no retention window, no silent pruning.
