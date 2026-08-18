@@ -130,8 +130,8 @@ header bar, no chrome you did not ask for.
 ## Quick start
 
 ```bash
-git clone https://github.com/yourusername/ratarss.git
-cd ratarss
+git clone https://github.com/deep-blue-dark-red/RataRSS.git
+cd RataRSS
 cargo build --release
 ./target/release/ratarss
 ```
