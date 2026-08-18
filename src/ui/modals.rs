@@ -487,7 +487,7 @@ impl<'a> ConfigMenuModal<'a> {
         let page_keys = format!("{}, {}", self.config.keybindings.page_down, self.config.keybindings.page_up);
         let jump_keys = format!("{}, {}", self.config.keybindings.jump_top, self.config.keybindings.jump_bottom);
 
-        let bindings: [(&str, &str, &str); 25] = [
+        let bindings: [(&str, &str, &str); 26] = [
             ("Toggle Config Menu", self.config.keybindings.toggle_config.as_str(), "Open / close this popup"),
             ("Quit Application", self.config.keybindings.quit.as_str(), "Exit RataRSS"),
             ("Help / Cheatsheet", self.config.keybindings.help.as_str(), "Open help modal"),
@@ -496,7 +496,8 @@ impl<'a> ConfigMenuModal<'a> {
             ("Export OPML", self.config.keybindings.export_opml.as_str(), "Export subscriptions"),
             ("Delete Feed / Folder", self.config.keybindings.delete_item.as_str(), "Remove selected item"),
             ("Zen / Fullscreen", self.config.keybindings.toggle_zen.as_str(), "Maximize current pane"),
-            ("Search Articles", self.config.keybindings.search.as_str(), "Filter articles by query"),
+            ("Search Articles", self.config.keybindings.search.as_str(), "Fuzzy-find articles in this view"),
+            ("Search Feeds", self.config.keybindings.search_feeds.as_str(), "Fuzzy-find a feed in the sidebar"),
             ("Refresh Feed", self.config.keybindings.refresh_current.as_str(), "Sync current feed"),
             ("Refresh All Feeds", self.config.keybindings.refresh_all.as_str(), "Sync all feeds"),
             ("Toggle Read / Unread", self.config.keybindings.toggle_read.as_str(), "Toggle article read status"),
@@ -606,7 +607,8 @@ impl<'a> Widget for HelpModal<'a> {
                 ("Shift+M", "Mark all articles in current view as read"),
                 ("o / Enter", "Open article URL in system default browser"),
                 ("y", "Copy article URL to system clipboard"),
-                ("Ctrl+F / Ctrl+S", "Live search / filter articles in current view"),
+                ("Ctrl+A", "Fuzzy search articles in the current view"),
+                ("Ctrl+F", "Fuzzy search feeds in the sidebar"),
             ]),
             ("Configuration & Themes", vec![
                 ("/", "Toggle interactive Configuration Menu popup"),

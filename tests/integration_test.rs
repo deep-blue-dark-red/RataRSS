@@ -180,7 +180,8 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.keybindings.toggle_config, "/");
         assert!(config.keybindings.quit.contains("q"));
-        assert!(config.keybindings.search.contains("ctrl+f"));
+        assert!(config.keybindings.search.contains("ctrl+a"));
+        assert!(config.keybindings.search_feeds.contains("ctrl+f"));
     }
 
     #[tokio::test]
@@ -399,6 +400,8 @@ mod render_tests {
                         scroll_offset: 0,
                         show_icons,
                         padding,
+                        search_query: "fee",
+                        is_searching: padding % 2 == 0,
                     }
                     .render(area, &mut buf);
 
@@ -595,6 +598,135 @@ mod render_tests {
                 }
             }
         }
+    }
+
+    /// `ctrl+f` changed meaning from article search to feed search. A config
+    /// written before that still says `search = "ctrl+f, ctrl+s"`, which would
+    /// leave the user with no article-search binding and two things fighting
+    /// over ctrl+f, so the untouched default is migrated on load — and a
+    /// customised binding is not.
+    #[test]
+    fn old_search_binding_migrates_but_custom_one_survives() {
+        use ratarss::config::AppConfig;
+
+        let old = r#"
+theme = "Nord"
+sidebar_ratio = 22
+article_list_ratio = 33
+reader_ratio = 45
+refresh_interval_minutes = 15
+auto_refresh_on_startup = true
+mark_read_on_open = true
+max_articles_per_feed = 200
+show_icons = true
+wrap_article_text = true
+"#;
+
+        // Old default: migrated, and feed search gets the new default.
+        let mut cfg: AppConfig =
+            toml::from_str(&format!("{old}\n[keybindings]\nsearch = \"ctrl+f, ctrl+s\"\n"))
+                .expect("old config must still parse");
+        assert_eq!(cfg.keybindings.search_feeds, "ctrl+f");
+        cfg.keybindings.migrate();
+        assert_eq!(cfg.keybindings.search, "ctrl+a");
+
+        // Custom binding: left alone.
+        let mut custom: AppConfig =
+            toml::from_str(&format!("{old}\n[keybindings]\nsearch = \"ctrl+k\"\n"))
+                .expect("custom config must parse");
+        custom.keybindings.migrate();
+        assert_eq!(custom.keybindings.search, "ctrl+k");
+    }
+
+    /// Fuzzy search is only useful if the ranking is right: an acronym should
+    /// find the multi-word title, a prefix should beat a mid-word coincidence,
+    /// and out-of-order characters should not match at all.
+    /// Drive the real key handler: ctrl+f must open the sidebar's feed filter
+    /// and ctrl+a the article one. Assertions hold for any database contents —
+    /// the smart views are always present, and no feed matches gibberish.
+    #[tokio::test]
+    async fn search_bindings_enter_the_right_mode() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        use ratarss::model::ActivePane;
+
+        fn key(c: char, mods: KeyModifiers) -> KeyEvent {
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: mods,
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::NONE,
+            }
+        }
+
+        let rt = tokio::runtime::Handle::current();
+        let mut app = ratarss::App::new(rt).expect("app new failed");
+        let sidebar_len = app.sidebar_items.len();
+        assert!(sidebar_len > 0, "smart views should always be listed");
+
+        // ctrl+f -> feed search, focused on the sidebar.
+        app.handle_key_event(key('f', KeyModifiers::CONTROL));
+        assert!(app.is_searching_feeds);
+        assert_eq!(app.active_pane, ActivePane::Sidebar);
+
+        // Typing filters the sidebar; gibberish matches nothing.
+        for c in "zqxjv".chars() {
+            app.handle_key_event(key(c, KeyModifiers::NONE));
+        }
+        assert_eq!(app.feed_search_query, "zqxjv");
+        assert!(app.sidebar_items.is_empty(), "no feed should fuzzy-match gibberish");
+
+        // Esc restores the normal sidebar.
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+        assert!(!app.is_searching_feeds);
+        assert!(app.feed_search_query.is_empty());
+        assert_eq!(app.sidebar_items.len(), sidebar_len);
+
+        // ctrl+a -> article search, focused on the list.
+        app.handle_key_event(key('a', KeyModifiers::CONTROL));
+        assert!(app.is_searching);
+        assert_eq!(app.active_pane, ActivePane::ArticleList);
+    }
+
+    #[test]
+    fn fuzzy_ranks_the_way_a_reader_expects() {
+        use ratarss::fuzzy::{score, score_any};
+
+        // Subsequence, case-insensitive.
+        assert!(score("Bloomberg Markets", "bm").is_some());
+        assert!(score("Bloomberg Markets", "blmkt").is_some());
+        // Out of order does not match. ("mb" would match Bloo*m*_b_erg, which is
+        // correct subsequence behaviour, so pick letters that truly reverse.)
+        assert!(score("Hacker News", "nh").is_none());
+        // Absent character does not match.
+        assert!(score("Hacker News", "hz").is_none());
+        // Empty needle matches everything; empty haystack matches nothing.
+        assert_eq!(score("anything", ""), Some(0));
+        assert!(score("", "a").is_none());
+
+        // Word-start acronym beats an accidental mid-word subsequence.
+        let acronym = score("Bloomberg Markets", "bm").unwrap();
+        let midword = score("Abbreviated Plumber", "bm").unwrap();
+        assert!(acronym > midword, "acronym {acronym} should beat {midword}");
+
+        // A prefix match beats the same letters buried later.
+        let prefix = score("Rust Blog", "rust").unwrap();
+        let buried = score("The Trust Fall", "rust").unwrap();
+        assert!(prefix > buried, "prefix {prefix} should beat {buried}");
+
+        // Consecutive runs beat scattered characters.
+        let tight = score("Hacker News", "hacker").unwrap();
+        let loose = score("Have A Chance To Kill Every Rabbit", "hacker").unwrap();
+        assert!(tight > loose, "tight {tight} should beat loose {loose}");
+
+        // score_any takes the best field.
+        let best = score_any(["nothing here", "Hacker News"], "hn").unwrap();
+        assert_eq!(best, score("Hacker News", "hn").unwrap());
+        assert!(score_any(["alpha", "beta"], "zz").is_none());
     }
 
     #[test]

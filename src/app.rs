@@ -7,6 +7,7 @@ use crate::theme::Theme;
 use crate::ui::modals::{ConfigSubView, ModalHelper};
 use ratatui::layout::Rect;
 
+use crate::fuzzy;
 use crate::reader::{render_article_to_text, FormattedArticle};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::cell::{Cell, RefCell};
@@ -43,6 +44,9 @@ pub enum AppEvent {
     },
 }
 
+/// Rows listed in the keybindings sub-view.
+const KEYBIND_ROWS: usize = 26;
+
 /// Number of rows in the main configuration menu.
 const CONFIG_MENU_ITEMS: usize = 11;
 
@@ -60,32 +64,6 @@ fn adjust(counter: &mut usize, delta: isize) {
     } else {
         *counter = counter.saturating_sub(delta.unsigned_abs());
     }
-}
-
-/// Case-insensitive substring test that allocates nothing.
-///
-/// `needle` must already be lowercase. The previous search lowercased every
-/// title, summary and author of every article on each keystroke, which meant
-/// allocating a copy of the entire visible corpus per typed character.
-fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    if haystack.len() < needle.len() {
-        return false;
-    }
-
-    // ASCII fast path covers essentially all feed text.
-    if haystack.is_ascii() && needle.is_ascii() {
-        let hay = haystack.as_bytes();
-        let ned = needle.as_bytes();
-        return hay
-            .windows(ned.len())
-            .any(|w| w.eq_ignore_ascii_case(ned));
-    }
-
-    let hay_lower = haystack.to_lowercase();
-    hay_lower.contains(needle)
 }
 
 pub struct App {
@@ -136,6 +114,9 @@ pub struct App {
     // Search & Filter State
     pub search_query: String,
     pub is_searching: bool,
+    /// Fuzzy filter over the sidebar's feeds (`ctrl+f`).
+    pub feed_search_query: String,
+    pub is_searching_feeds: bool,
 
     // Modals & Popups
     pub show_config_modal: bool,
@@ -218,6 +199,8 @@ impl App {
 
             search_query: String::new(),
             is_searching: false,
+            feed_search_query: String::new(),
+            is_searching_feeds: false,
 
             show_config_modal: false,
             config_menu_selected_idx: 0,
@@ -279,6 +262,45 @@ impl App {
     }
 
     pub fn rebuild_sidebar_items(&mut self) {
+        // While the sidebar is being searched it shows a flat, best-first list
+        // of matching feeds: smart views and folder grouping would only get in
+        // the way of picking one.
+        let query = self.feed_search_query.trim().to_lowercase();
+        if !query.is_empty() {
+            let mut scored: Vec<(i32, &Feed)> = Vec::new();
+            for f in &self.feeds {
+                let folder = f.folder.as_deref().unwrap_or("");
+                if let Some(score) = fuzzy::score_any([f.title.as_str(), folder], &query) {
+                    scored.push((score, f));
+                }
+            }
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.title.cmp(&b.1.title)));
+
+            self.sidebar_items = scored
+                .into_iter()
+                .map(|(_, f)| {
+                    let (unread, _) = self
+                        .unread_counts
+                        .feed_counts
+                        .get(&f.id)
+                        .cloned()
+                        .unwrap_or((0, 0));
+                    SidebarItem::Feed {
+                        feed_id: f.id.clone(),
+                        title: f.title.clone(),
+                        folder: f.folder.clone(),
+                        unread_count: unread,
+                        has_error: f.error.is_some(),
+                    }
+                })
+                .collect();
+
+            if self.sidebar_selected_idx >= self.sidebar_items.len() {
+                self.sidebar_selected_idx = self.sidebar_items.len().saturating_sub(1);
+            }
+            return;
+        }
+
         let mut items = Vec::new();
 
         // 1. Smart Feeds Header & Items
@@ -386,16 +408,30 @@ impl App {
         }
 
         let needle: String = query.to_lowercase();
-        let mut matches: Vec<u32> = Vec::new();
+
+        // Fuzzy-match each article, keeping the score so results can be ranked
+        // by how well they matched rather than by position in the feed.
+        let mut scored: Vec<(i32, u32)> = Vec::new();
         for (idx, a) in self.articles.iter().enumerate() {
-            let hit = contains_ignore_case(&a.title, &needle)
-                || contains_ignore_case(&a.feed_title, &needle)
-                || a.summary.as_deref().is_some_and(|s| contains_ignore_case(s, &needle))
-                || a.author.as_deref().is_some_and(|s| contains_ignore_case(s, &needle));
-            if hit {
-                matches.push(idx as u32);
+            let score = fuzzy::score_any(
+                [
+                    a.title.as_str(),
+                    a.feed_title.as_str(),
+                    a.summary.as_deref().unwrap_or(""),
+                    a.author.as_deref().unwrap_or(""),
+                ],
+                &needle,
+            );
+            if let Some(score) = score {
+                scored.push((score, idx as u32));
             }
         }
+
+        // Best score first; ties keep the list's own order, which is newest
+        // first, so equally good matches stay chronological.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        let mut matches: Vec<u32> = scored.into_iter().map(|(_, idx)| idx).collect();
         matches.shrink_to_fit();
         self.filtered = Some(matches);
     }
@@ -443,6 +479,14 @@ impl App {
         self.article_selected_idx = 0;
         self.article_scroll_offset = 0;
         self.recompute_filter();
+    }
+
+    /// Update the feed search query and rebuild the sidebar to match.
+    pub fn set_feed_search(&mut self, edit: impl FnOnce(&mut String)) {
+        edit(&mut self.feed_search_query);
+        self.sidebar_selected_idx = 0;
+        self.sidebar_scroll_offset = 0;
+        self.rebuild_sidebar_items();
     }
 
     /// The formatted reader output for the current selection, rendering it only
@@ -726,6 +770,42 @@ impl App {
             return;
         }
 
+        // 7a. Feed search input mode (sidebar)
+        if self.is_searching_feeds {
+            match key.code {
+                KeyCode::Esc => {
+                    self.is_searching_feeds = false;
+                    self.set_feed_search(|q| q.clear());
+                }
+                KeyCode::Enter => {
+                    // Commit the highlighted feed and get out of the way.
+                    self.apply_sidebar_selection();
+                    self.is_searching_feeds = false;
+                    self.set_feed_search(|q| q.clear());
+                    self.active_pane = ActivePane::ArticleList;
+                }
+                KeyCode::Backspace => {
+                    self.set_feed_search(|q| {
+                        q.pop();
+                    });
+                }
+                // j/k are literal text while typing, so navigate with arrows.
+                KeyCode::Down => {
+                    if self.sidebar_selected_idx + 1 < self.sidebar_items.len() {
+                        self.sidebar_selected_idx += 1;
+                    }
+                }
+                KeyCode::Up => {
+                    self.sidebar_selected_idx = self.sidebar_selected_idx.saturating_sub(1);
+                }
+                KeyCode::Char(c) => {
+                    self.set_feed_search(|q| q.push(c));
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // 7. Search input mode
         if self.is_searching {
             match key.code {
@@ -811,6 +891,13 @@ impl App {
             self.active_pane = ActivePane::ArticleList;
             self.is_searching = true;
             self.set_search_query(|q| q.clear());
+            return;
+        }
+
+        if kb.matches(&key, &kb.search_feeds) {
+            self.active_pane = ActivePane::Sidebar;
+            self.is_searching_feeds = true;
+            self.set_feed_search(|q| q.clear());
             return;
         }
 
@@ -969,7 +1056,7 @@ impl App {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.config_keybind_selected_idx + 1 < 25 {
+                    if self.config_keybind_selected_idx + 1 < KEYBIND_ROWS {
                         self.config_keybind_selected_idx += 1;
                     }
                 }
@@ -1246,7 +1333,7 @@ impl App {
         if self.show_config_modal {
             if self.config_menu_subview == ConfigSubView::Keybindings {
                 if down {
-                    if self.config_keybind_selected_idx + 1 < 25 {
+                    if self.config_keybind_selected_idx + 1 < KEYBIND_ROWS {
                         self.config_keybind_selected_idx += 1;
                     }
                 } else if self.config_keybind_selected_idx > 0 {
@@ -1342,7 +1429,7 @@ impl App {
                     let visible_height = popup.height.saturating_sub(3) as usize;
                     if row >= inner_y && row < inner_y + (visible_height as u16) {
                         let clicked_row = (row - inner_y) as usize;
-                        if clicked_row < 25 {
+                        if clicked_row < KEYBIND_ROWS {
                             self.config_keybind_selected_idx = clicked_row;
                         }
                     }
@@ -1453,9 +1540,13 @@ impl App {
     }
 
     fn handle_sidebar_click(&mut self, row: u16) {
-        // Row 0 is the pane border; the first item sits on row 1.
-        if row >= 1 {
-            let clicked_row = (row - 1) as usize + self.sidebar_scroll_offset;
+        // Row 0 is the pane border, then the search bar when it is showing.
+        let first_item_y = 1 + crate::ui::sidebar::SidebarView::search_rows(
+            self.is_searching_feeds,
+            &self.feed_search_query,
+        );
+        if row >= first_item_y {
+            let clicked_row = (row - first_item_y) as usize + self.sidebar_scroll_offset;
             if clicked_row < self.sidebar_items.len() {
                 self.sidebar_selected_idx = clicked_row;
                 if let Some(SidebarItem::FolderHeader { name, .. }) = self.sidebar_items.get(clicked_row) {

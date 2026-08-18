@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod fetcher;
+mod fuzzy;
 mod model;
 mod opml;
 mod reader;

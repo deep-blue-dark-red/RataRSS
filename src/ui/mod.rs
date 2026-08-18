@@ -138,6 +138,8 @@ fn sidebar_view(app: &App) -> SidebarView<'_> {
         scroll_offset: app.sidebar_scroll_offset,
         show_icons: app.config.show_icons,
         padding: app.config.padding,
+        search_query: &app.feed_search_query,
+        is_searching: app.is_searching_feeds,
     }
 }
 

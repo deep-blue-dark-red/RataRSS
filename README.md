@@ -1,6 +1,8 @@
 # 📰 RataRSS
 
-> A fast, beautiful, themable, and customizable terminal RSS reader built with [Ratatui](https://ratatui.rs) in Rust.
+A modern, beautiful, extremely fast RSS reader for your terminal.
+
+Built with [Ratatui](https://ratatui.rs) in Rust.
 
 ![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)
 ![Ratatui](https://img.shields.io/badge/Ratatui-0.29-blue.svg)
@@ -8,116 +10,184 @@
 
 ---
 
-## ✨ Features
-
-- 🖥️ **Minimal 3-Pane TUI Layout**:
-  0. **No top bar**: the panes start at the first row. All chrome lives in a single status line — brand bottom-left, sync/toast state beside it, layout and theme on the right.
-  1. **Sidebar**: Smart Feeds (☀️ *Today*, 🔵 *All Unread*, ⭐ *Starred*, 📜 *All Articles*) + Collapsible Folders with unread count badges.
-  2. **Article List**: Multi-line article cards displaying unread indicators (`●`), star markers (`★`), bold titles, summary previews, source tags, and relative timestamps (`1:20 PM`, `Yesterday`).
-  3. **Reader View**: Clean typography, rich HTML/Markdown formatting (headings, blockquotes, code blocks, bullet points, links), and a clean line position indicator (`1/18`).
-  - **Declutter to taste**: adjustable content padding, article spacing in half-row steps, every icon and emoji removable, and shortcut hints hidden by default — toggle them with `??` or from `/`.
-  - **Clickable links**: anchors in article HTML are drawn underlined and open in your browser on click, as does the article's own URL.
-- ⚙️ **Interactive Configuration Menu (`/`)**:
-  - Press `/` anywhere to toggle an interactive bottom popup menu.
-  - Configure themes, auto-refresh on startup, refresh intervals, mark-read behavior, text wrapping, icons on/off, content padding, status-bar shortcut hints, and pane layout proportions live with instant persistence.
-  - Full support for **user-configurable keybindings** saved in `~/.config/ratarss/config.toml`.
-- 🎨 **27 Built-in Themes & Full Palette Customization**:
-  - Includes **RataRSS Dark** *(Default)*, **RataRSS Light**, **Catppuccin Mocha**, **Catppuccin Macchiato**, **Catppuccin Frappé**, **Catppuccin Latte**, **Tokyo Night**, **Tokyo Night Storm**, **Gruvbox Dark**, **Gruvbox Light**, **Nord**, **Dracula**, **Solarized Dark**, **Solarized Light**, **Rosé Pine**, **Rosé Pine Dawn**, **Rosé Pine Moon**, **Monokai Pro**, **One Dark**, **GitHub Dark**, **GitHub Light**, **Kanagawa**, **Everforest Dark**, **Everforest Light**, **Cyberpunk Neon**, **Horizon**, and **Minimal Monochrome**.
-  - Interactive theme picker (`T` or `t`) with live search, smooth scrolling, and dynamic window sizing.
-- ⚡ **Optimized Performance & Battery Friendly**:
-  - Reactive event loop that sleeps when idle and coalesces input bursts, so held keys and scroll wheels never queue up behind redraws.
-  - Nothing is copied to draw a frame: panes borrow the article list, and the reader keeps its formatted text cached until the article, width or theme changes.
-  - Article bodies stay in SQLite. The list reads **no compressed column at all** — it draws a stored plain-text `snippet` — and only the single article on screen is ever decompressed.
-  - Views sort on a stored `sort_ts` key with covering indexes, so SQLite walks an index instead of sorting the whole table. On a real 13k-article database, opening *All Unread* went from ~177 ms (and 24 MB decompressed) to ~9 ms (and none).
-  - Read/star changes patch state in place instead of re-querying the database.
-- 📥 **Standard OPML Import & Export**:
-  - Full support for standard OPML 1.0 & 2.0 files with nested folders and metadata.
-  - Interactive import/export modals in-app (`a` for add/import, `e` for export).
-  - Headless CLI flags: `ratarss --import feeds.opml` and `ratarss --export backup.opml`.
-- 🔄 **Unlimited Persistent Storage with Zstandard (zstd) Compression**:
-  - Embedded **SQLite engine** with Write-Ahead Logging (`WAL` mode) and indexes for instant sub-millisecond queries.
-  - Transparent **Zstandard (zstd level 3)** compression on all article bodies and summaries (75–85% disk space reduction).
-  - Millions of articles can be stored and archived persistently with negligible disk usage and gigabytes/sec decompression.
-  - A single pooled connection with cached prepared statements; the legacy compression migration runs once and then marks itself done.
-  - Automatic migration compresses any existing legacy articles seamlessly on startup.
-- 🌐 **Robust Multi-Feed Background Sync**:
-  - Concurrent non-blocking background feed fetching with connection timeouts and auto-completion.
-  - Automatic feed discovery from website URLs.
-- 🔍 **Realtime Search & Filter**:
-  - Press `Ctrl+F` (or customize in keybindings) to filter article titles, snippets, authors, and sources in real time.
-- 🌐 **Browser & Clipboard Integration**:
-  - Press `o` or `Enter` in the reader to open the original article in your default browser.
-  - Press `y` to copy article link to your clipboard.
+RataRSS keeps every article you have ever fetched, compressed, on disk — and
+still opens one in about **35 microseconds**. It reads like a native app, runs in
+any terminal, and never makes you wait.
 
 ---
 
-## 🚀 Quick Start
+## Why it feels fast
 
-### Build and Run
+Every number below was measured on a real library: **13,098 articles across 474
+feeds**, a 21 MB database, on an ordinary laptop.
+
+| Action | Time |
+|---|---|
+| Open an article — fetch, decompress, format | **35 µs** median · 49 µs p90 · 164 µs p99 |
+| Open *All Unread* — 12,864 articles | **8.9 ms** |
+| Open *Today* — 4,224 articles | **1.6 ms** |
+| Fuzzy search, per keystroke, across 13,098 articles | **8–10 ms** |
+| Resident memory, whole app | **21 MB** |
+
+Nothing is precomputed overnight. There is no background daemon. The speed comes
+from four decisions.
+
+**The list never touches a compressed column.** Every article stores a short
+plain-text snippet beside its compressed body, so drawing a list of 13,000
+articles decompresses exactly nothing. Only the article you are actually reading
+is ever expanded.
+
+**The database sorts with an index, not a temp table.** Views order by a stored
+sort key with covering indexes behind it, so SQLite walks rows that are already in
+order instead of sorting the whole table on every click.
+
+**Frames copy nothing.** Panes borrow the article list rather than cloning it, and
+the reader holds its formatted, wrapped, styled text until the article, the pane
+width or the theme actually changes. Scrolling redraws; it does not re-parse.
+
+**The event loop sleeps.** It idles at 250 ms, wakes to 100 ms only while syncing,
+and drains a whole burst of input before drawing — so holding `j` scrolls with the
+key instead of trailing a frame behind it.
+
+---
+
+## Storage that forgets nothing
+
+Your library is an embedded SQLite database in WAL mode. **Nothing is ever deleted
+unless you delete it.** No article cap, no retention window, no silent pruning.
+
+Bodies and summaries are transparently compressed with **Zstandard** — typically
+75–85% smaller. The library above holds 5.3 MB of compressed text and decompresses
+at gigabytes per second, which is why opening an article is dominated by
+formatting rather than by I/O.
+
+Feeds sync concurrently in the background, ten at a time, without ever blocking
+the interface.
+
+---
+
+## Three panes
+
+**Sidebar** — Smart views (*Today*, *All Unread*, *Starred*, *All Articles*) above
+your folders and feeds, each with an unread badge. Folders collapse.
+
+**Article list** — Multi-line cards: unread dot, star, title, snippet, source, and
+a relative timestamp.
+
+**Reader** — Real typography: headings, blockquotes, code blocks, lists and links.
+Links are drawn underlined and **open in your browser when you click them**.
+
+Move between panes with `Tab`, arrow keys, `h`/`l`, or by clicking. Jump straight
+to one with `1`, `2`, `3`. Scroll with `j`/`k`, arrows, `PageUp`/`PageDown`,
+`Space`, or the mouse wheel — the wheel scrolls whichever pane is under the
+pointer.
+
+Press `f` for **Zen mode** and the focused pane fills the screen.
+
+---
+
+## Fuzzy finding
+
+`Ctrl+A` finds **articles** in the current view. `Ctrl+F` finds **feeds** — the
+sidebar collapses to a flat, best-first list; arrows move, `Enter` opens, `Esc`
+restores.
+
+Matching is subsequence-based and ranked, so `bm` finds *Bloomberg Markets* and
+`hn` finds *Hacker News*. Word starts, prefixes and consecutive runs score higher,
+which puts the result you meant at the top rather than merely somewhere in the
+list.
+
+---
+
+## Yours to shape
+
+**46 themes**: RataRSS Dark and Light, all four Catppuccins, Tokyo Night (plus
+Storm, Moon, Day), Gruvbox, Gruvbox Material, Nord, Dracula, Solarized, Rosé Pine
+(plus Dawn, Moon), Monokai Pro, One Dark, GitHub, Kanagawa, Everforest, Horizon,
+Nightfox, Ayu (Dark, Mirage, Light), Material Ocean, Zenburn, Iceberg, Oxocarbon,
+Melange, Poimandres, Vesper, Flexoki, PaperColor, Cyberpunk Neon and Minimal
+Monochrome.
+
+Light themes always sort to the bottom of the picker — classified by measuring
+each palette's background, not by trusting its name.
+
+Press `/` for settings. Everything saves the moment you change it:
+
+- **Theme**, with a live searchable picker (`T`)
+- **Content padding**, 0–6 cells
+- **Article spacing**, in half-row steps
+- **Icons on or off** — every emoji in the interface disappears
+- **Shortcut hints** in the status bar, or toggle them anywhere with `??`
+- **Pane proportions**, auto-refresh, refresh interval, mark-read behaviour
+
+Every key is rebindable in `~/.config/ratarss/config.toml`.
+
+The interface itself stays out of the way: one status line at the bottom, no
+header bar, no chrome you did not ask for.
+
+---
+
+## Quick start
+
 ```bash
-# Clone the repository
-git clone https://github.com/ratarss/ratarss.git
+git clone https://github.com/yourusername/ratarss.git
 cd ratarss
-
-# Run with default curated feeds
-cargo run
-
-# Or build the release binary
 cargo build --release
 ./target/release/ratarss
 ```
 
-### CLI Options
+The binary is 8 MB and depends on nothing but your terminal. SQLite is compiled
+in.
+
+### Bring your feeds
+
 ```bash
-# Import subscriptions from an OPML file
-ratarss --import ~/Downloads/subscriptions.opml
-
-# Export subscriptions to OPML
-ratarss --export my_feeds_backup.opml
-
-# Add a feed directly from the command line
-ratarss --add "https://news.ycombinator.com/rss" --folder "Tech"
-
-# Launch with a specific theme
-ratarss --theme "Catppuccin Mocha"
+ratarss --import subscriptions.opml     # OPML 1.0 and 2.0, nested folders
+ratarss --export backup.opml
+ratarss --add https://example.com/feed --folder News
+ratarss --theme "Rosé Pine"
 ```
 
----
-
-## ⌨️ Default Keyboard Reference
-
-*(All keybindings can be customized in `~/.config/ratarss/config.toml` or viewed via the `/` config menu)*
-
-| Category | Keybinding | Action |
-| :--- | :--- | :--- |
-| **Navigation** | `Tab` / `Shift+Tab` | Cycle focus between Sidebar, Article List, and Reader |
-| | `1` / `2` / `3` | Direct jump to Sidebar (`1`), Article List (`2`), Reader (`3`) |
-| | `h` / `l` or `←` / `→` | Move focus left / right |
-| | `j` / `k` or `↓` / `↑` | Navigate items in list or scroll article |
-| | `Space` | Page down reader / advance to next unread |
-| | `g` / `G` | Jump to top / bottom of active view |
-| **Article Actions** | `m` | Toggle Read / Unread status |
-| | `Shift+M` | Mark all articles in current view as read |
-| | `s` | Toggle Star / Bookmark |
-| | `o` / `Enter` | Open article in default web browser |
-| | `y` | Copy article URL to clipboard |
-| | `Ctrl+F` / `Ctrl+S` | Real-time search & filter articles |
-| **Configuration** | `/` | Toggle interactive Configuration Menu popup |
-| | `T` or `t` | Open interactive Theme Picker (27 themes) |
-| **Pane Resizing** | `<` / `>` | Decrease / Increase Sidebar width |
-| | `[` / `]` | Decrease / Increase Article List width |
-| | `+` / `-` | Decrease / Increase Reader width |
-| | `=` | Reset layout to default percentages |
-| | `f` or `z` | Toggle Fullscreen / Zen mode for active pane |
-| **Feed Management** | `a` | Add feed URL or Import OPML modal |
-| | `e` | Export subscriptions to OPML modal |
-| | `r` / `R` | Refresh current feed / Refresh all feeds |
-| | `d` | Delete selected feed or folder |
-| | `?` or `F1` | Open Help modal |
-| | `q` / `Ctrl+C` | Quit application |
+Or do it in the app: `a` to add a feed or import OPML, `e` to export. Point `--add`
+at a website rather than a feed and RataRSS will discover the feed for you.
 
 ---
 
-## 📄 License
+## Keys
 
-Distributed under the MIT License.
+| | |
+|---|---|
+| `Tab` / `Shift+Tab` | Cycle panes |
+| `1` `2` `3` | Sidebar / articles / reader |
+| `j` `k` · arrows · wheel | Move and scroll |
+| `g` / `G` | Top / bottom |
+| `Enter` | Open selection |
+| `Ctrl+A` / `Ctrl+F` | Fuzzy find articles / feeds |
+| `m` / `M` | Mark read / mark all read |
+| `s` | Star |
+| `o` | Open in browser |
+| `y` | Copy link |
+| `r` / `R` | Refresh feed / all feeds |
+| `a` / `e` / `d` | Add / export / delete |
+| `f` | Zen mode |
+| `/` · `T` | Settings · themes |
+| `?` · `??` | Help · toggle status-bar hints |
+| `q` | Quit |
+
+---
+
+## Building
+
+```bash
+cargo test              # unit, integration and render tests
+cargo build --release   # LTO, single codegen unit
+```
+
+Requires Rust 1.75+ and a terminal with 24-bit colour. Developed and measured on
+macOS.
+
+---
+
+## License
+
+MIT.

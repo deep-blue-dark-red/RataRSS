@@ -69,6 +69,105 @@ pub struct ThemeConfig {
     pub warning_fg: String,
 }
 
+
+/// A compact palette from which a full [`ThemeConfig`] is derived.
+///
+/// The full config names about fifty roles, but a palette only really has a
+/// dozen decisions in it. Writing new themes as palettes keeps the derived
+/// roles consistent across themes — and keeps a new theme to a dozen lines
+/// instead of fifty near-identical ones.
+pub struct Palette {
+    pub name: &'static str,
+    pub description: &'static str,
+    /// Main background.
+    pub bg: &'static str,
+    /// Recessed background: sidebar, cards, status bar.
+    pub bg_alt: &'static str,
+    /// Selected-row background.
+    pub bg_sel: &'static str,
+    pub fg: &'static str,
+    pub fg_dim: &'static str,
+    pub fg_subtle: &'static str,
+    pub accent: &'static str,
+    pub red: &'static str,
+    pub green: &'static str,
+    pub yellow: &'static str,
+    pub blue: &'static str,
+    pub magenta: &'static str,
+    pub cyan: &'static str,
+}
+
+impl From<Palette> for Theme {
+    fn from(p: Palette) -> Self {
+        ThemeConfig::from(p).into()
+    }
+}
+
+impl From<Palette> for ThemeConfig {
+    fn from(p: Palette) -> Self {
+        ThemeConfig {
+            name: p.name.to_string(),
+            description: p.description.to_string(),
+
+            bg: p.bg.to_string(),
+            fg: p.fg.to_string(),
+            fg_dim: p.fg_dim.to_string(),
+            fg_subtle: p.fg_subtle.to_string(),
+            accent: p.accent.to_string(),
+            accent_subtle: p.bg_sel.to_string(),
+            selection_bg: p.bg_sel.to_string(),
+            selection_fg: p.accent.to_string(),
+
+            border_active: p.accent.to_string(),
+            border_inactive: p.bg_sel.to_string(),
+            border_accent: p.blue.to_string(),
+
+            sidebar_bg: p.bg_alt.to_string(),
+            sidebar_header_fg: p.fg_subtle.to_string(),
+            sidebar_folder_fg: p.blue.to_string(),
+            sidebar_feed_fg: p.fg.to_string(),
+            sidebar_unread_badge_bg: p.bg_sel.to_string(),
+            sidebar_unread_badge_fg: p.accent.to_string(),
+
+            article_list_bg: p.bg.to_string(),
+            article_card_bg: p.bg_alt.to_string(),
+            article_card_selected_bg: p.bg_sel.to_string(),
+            article_card_selected_border: p.accent.to_string(),
+            article_title_unread: p.fg.to_string(),
+            article_title_read: p.fg_subtle.to_string(),
+            article_summary_fg: p.fg_dim.to_string(),
+            article_meta_fg: p.cyan.to_string(),
+            article_unread_dot: p.accent.to_string(),
+            article_star: p.yellow.to_string(),
+
+            reader_bg: p.bg.to_string(),
+            reader_header_feed: p.blue.to_string(),
+            reader_header_author: p.fg_dim.to_string(),
+            reader_title: p.fg.to_string(),
+            reader_meta: p.fg_subtle.to_string(),
+            reader_divider: p.bg_sel.to_string(),
+            reader_body: p.fg.to_string(),
+            reader_h1: p.accent.to_string(),
+            reader_h2: p.blue.to_string(),
+            reader_h3: p.cyan.to_string(),
+            reader_quote_border: p.magenta.to_string(),
+            reader_quote_fg: p.fg_dim.to_string(),
+            reader_code_bg: p.bg_alt.to_string(),
+            reader_code_fg: p.green.to_string(),
+            reader_link: p.accent.to_string(),
+            reader_link_url: p.cyan.to_string(),
+
+            status_bar_bg: p.bg_alt.to_string(),
+            status_bar_fg: p.fg_dim.to_string(),
+            modal_bg: p.bg.to_string(),
+            modal_border: p.accent.to_string(),
+            error_fg: p.red.to_string(),
+            success_fg: p.green.to_string(),
+            warning_fg: p.yellow.to_string(),
+        }
+    }
+}
+
 pub fn parse_color(color_str: &str) -> Color {
     let s = color_str.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("reset") {
@@ -1987,8 +2086,245 @@ impl Theme {
         .into()
     }
 
+
+    // ---- Palette-defined themes ----------------------------------------
+    //
+    // Ordered dark first; `all_presets` sorts light ones to the bottom by
+    // measuring the background, so a theme's position here only affects its
+    // order within its own group.
+
+    pub fn ayu_dark() -> Self {
+        Palette {
+            name: "Ayu Dark",
+            description: "Deep ink background with warm amber highlights",
+            bg: "#0b0e14", bg_alt: "#0d1017", bg_sel: "#1b1f2b",
+            fg: "#bfbdb6", fg_dim: "#9a9791", fg_subtle: "#565b66",
+            accent: "#ffb454", red: "#f07178", green: "#aad94c",
+            yellow: "#ffb454", blue: "#59c2ff", magenta: "#d2a6ff", cyan: "#39bae6",
+        }
+        .into()
+    }
+
+    pub fn ayu_mirage() -> Self {
+        Palette {
+            name: "Ayu Mirage",
+            description: "Softer slate variant of Ayu, easy on the eyes",
+            bg: "#1f2430", bg_alt: "#1a1f29", bg_sel: "#2d3440",
+            fg: "#cccac2", fg_dim: "#a6a29a", fg_subtle: "#707a8c",
+            accent: "#ffcc66", red: "#f28779", green: "#d5ff80",
+            yellow: "#ffcc66", blue: "#73d0ff", magenta: "#dfbfff", cyan: "#5ccfe6",
+        }
+        .into()
+    }
+
+    pub fn material_ocean() -> Self {
+        Palette {
+            name: "Material Ocean",
+            description: "Deep ocean blues from the Material palette",
+            bg: "#0f111a", bg_alt: "#090b10", bg_sel: "#1f2233",
+            fg: "#a6accd", fg_dim: "#8f96b3", fg_subtle: "#4b526d",
+            accent: "#89ddff", red: "#f07178", green: "#c3e88d",
+            yellow: "#ffcb6b", blue: "#82aaff", magenta: "#c792ea", cyan: "#89ddff",
+        }
+        .into()
+    }
+
+    pub fn zenburn() -> Self {
+        Palette {
+            name: "Zenburn",
+            description: "Low-contrast muted classic, kind at 2am",
+            bg: "#3f3f3f", bg_alt: "#383838", bg_sel: "#4f4f4f",
+            fg: "#dcdccc", fg_dim: "#c0c0a8", fg_subtle: "#8f8f7f",
+            accent: "#f0dfaf", red: "#cc9393", green: "#7f9f7f",
+            yellow: "#f0dfaf", blue: "#8cd0d3", magenta: "#dc8cc3", cyan: "#93e0e3",
+        }
+        .into()
+    }
+
+    pub fn iceberg() -> Self {
+        Palette {
+            name: "Iceberg",
+            description: "Cold blue-grey with restrained accents",
+            bg: "#161821", bg_alt: "#0f1117", bg_sel: "#272c42",
+            fg: "#c6c8d1", fg_dim: "#a3a6b3", fg_subtle: "#6b7089",
+            accent: "#84a0c6", red: "#e27878", green: "#b4be82",
+            yellow: "#e2a478", blue: "#84a0c6", magenta: "#a093c7", cyan: "#89b8c2",
+        }
+        .into()
+    }
+
+    pub fn oxocarbon() -> Self {
+        Palette {
+            name: "Oxocarbon",
+            description: "IBM Carbon-derived near-black with vivid accents",
+            bg: "#161616", bg_alt: "#0d0d0d", bg_sel: "#262626",
+            fg: "#f2f4f8", fg_dim: "#c6c6c6", fg_subtle: "#6f6f6f",
+            accent: "#33b1ff", red: "#ee5396", green: "#42be65",
+            yellow: "#ffe97b", blue: "#33b1ff", magenta: "#be95ff", cyan: "#3ddbd9",
+        }
+        .into()
+    }
+
+    pub fn melange_dark() -> Self {
+        Palette {
+            name: "Melange Dark",
+            description: "Warm cocoa browns, low glare",
+            bg: "#292522", bg_alt: "#211f1c", bg_sel: "#403a35",
+            fg: "#ece1d7", fg_dim: "#c1a78e", fg_subtle: "#867462",
+            accent: "#d3a94a", red: "#d47766", green: "#85b695",
+            yellow: "#ebc06d", blue: "#a3a9ce", magenta: "#cf9bc2", cyan: "#89b3b6",
+        }
+        .into()
+    }
+
+    pub fn poimandres() -> Self {
+        Palette {
+            name: "Poimandres",
+            description: "Muted teal-on-navy, minimal and calm",
+            bg: "#1b1e28", bg_alt: "#171922", bg_sel: "#282c39",
+            fg: "#a6accd", fg_dim: "#8f95b2", fg_subtle: "#506477",
+            accent: "#5de4c7", red: "#d0679d", green: "#5de4c7",
+            yellow: "#fffac2", blue: "#89ddff", magenta: "#fcc5e9", cyan: "#add7ff",
+        }
+        .into()
+    }
+
+    pub fn vesper() -> Self {
+        Palette {
+            name: "Vesper",
+            description: "Near-monochrome dark with a single warm accent",
+            bg: "#101010", bg_alt: "#0a0a0a", bg_sel: "#232323",
+            fg: "#ffffff", fg_dim: "#a0a0a0", fg_subtle: "#505050",
+            accent: "#ffc799", red: "#ff8080", green: "#99ffe4",
+            yellow: "#ffc799", blue: "#a0a0a0", magenta: "#ffcfa8", cyan: "#99ffe4",
+        }
+        .into()
+    }
+
+    pub fn flexoki_dark() -> Self {
+        Palette {
+            name: "Flexoki Dark",
+            description: "Inky paper-inspired palette tuned for reading",
+            bg: "#100f0f", bg_alt: "#1c1b1a", bg_sel: "#282726",
+            fg: "#cecdc3", fg_dim: "#b7b5ac", fg_subtle: "#6f6e69",
+            accent: "#d0a215", red: "#d14d41", green: "#879a39",
+            yellow: "#d0a215", blue: "#4385be", magenta: "#ce5d97", cyan: "#3aa99f",
+        }
+        .into()
+    }
+
+    pub fn tokyo_night_moon() -> Self {
+        Palette {
+            name: "Tokyo Night Moon",
+            description: "Lighter, bluer sibling of Tokyo Night",
+            bg: "#222436", bg_alt: "#1e2030", bg_sel: "#2f334d",
+            fg: "#c8d3f5", fg_dim: "#a9b8e8", fg_subtle: "#636da6",
+            accent: "#82aaff", red: "#ff757f", green: "#c3e88d",
+            yellow: "#ffc777", blue: "#82aaff", magenta: "#c099ff", cyan: "#86e1fc",
+        }
+        .into()
+    }
+
+    pub fn gruvbox_material() -> Self {
+        Palette {
+            name: "Gruvbox Material",
+            description: "Softened Gruvbox with lower saturation",
+            bg: "#282828", bg_alt: "#1d2021", bg_sel: "#3c3836",
+            fg: "#d4be98", fg_dim: "#bdae93", fg_subtle: "#928374",
+            accent: "#a9b665", red: "#ea6962", green: "#a9b665",
+            yellow: "#d8a657", blue: "#7daea3", magenta: "#d3869b", cyan: "#89b482",
+        }
+        .into()
+    }
+
+    pub fn nightfox() -> Self {
+        Palette {
+            name: "Nightfox",
+            description: "Balanced dark blue with clear syntax hues",
+            bg: "#192330", bg_alt: "#131a24", bg_sel: "#29394f",
+            fg: "#cdcecf", fg_dim: "#aeafb0", fg_subtle: "#71839b",
+            accent: "#719cd6", red: "#c94f6d", green: "#81b29a",
+            yellow: "#dbc074", blue: "#719cd6", magenta: "#9d79d6", cyan: "#63cdcf",
+        }
+        .into()
+    }
+
+    // ---- Light themes ---------------------------------------------------
+
+    pub fn ayu_light() -> Self {
+        Palette {
+            name: "Ayu Light",
+            description: "Crisp warm white with amber accents",
+            bg: "#fcfcfc", bg_alt: "#f3f4f5", bg_sel: "#e7e8e9",
+            fg: "#5c6166", fg_dim: "#787b80", fg_subtle: "#8a8f98",
+            accent: "#ff9940", red: "#e65050", green: "#6cbf43",
+            yellow: "#f2ae49", blue: "#399ee6", magenta: "#a37acc", cyan: "#55b4d4",
+        }
+        .into()
+    }
+
+    pub fn papercolor_light() -> Self {
+        Palette {
+            name: "PaperColor Light",
+            description: "High-contrast paper white, strong primaries",
+            bg: "#eeeeee", bg_alt: "#e4e4e4", bg_sel: "#d0d0d0",
+            fg: "#444444", fg_dim: "#5f5f5f", fg_subtle: "#878787",
+            accent: "#0087af", red: "#af0000", green: "#008700",
+            yellow: "#d75f00", blue: "#0087af", magenta: "#8700af", cyan: "#005f87",
+        }
+        .into()
+    }
+
+    pub fn flexoki_light() -> Self {
+        Palette {
+            name: "Flexoki Light",
+            description: "Warm paper tone designed for long reading",
+            bg: "#fffcf0", bg_alt: "#f2f0e5", bg_sel: "#e6e4d9",
+            fg: "#100f0f", fg_dim: "#403e3c", fg_subtle: "#878580",
+            accent: "#bc5215", red: "#af3029", green: "#66800b",
+            yellow: "#ad8301", blue: "#205ea6", magenta: "#a02f6f", cyan: "#24837b",
+        }
+        .into()
+    }
+
+    pub fn melange_light() -> Self {
+        Palette {
+            name: "Melange Light",
+            description: "Soft sand tones, the light side of Melange",
+            bg: "#f1f1f1", bg_alt: "#e9e1db", bg_sel: "#dcd3cd",
+            fg: "#54433a", fg_dim: "#6b5a50", fg_subtle: "#a98a78",
+            accent: "#a06d00", red: "#c77b8b", green: "#6e9b72",
+            yellow: "#bc5c00", blue: "#7892bd", magenta: "#be79bb", cyan: "#739797",
+        }
+        .into()
+    }
+
+    pub fn tokyo_night_day() -> Self {
+        Palette {
+            name: "Tokyo Night Day",
+            description: "Daylight counterpart to Tokyo Night",
+            bg: "#e1e2e7", bg_alt: "#d0d5e3", bg_sel: "#c4c8da",
+            fg: "#3760bf", fg_dim: "#535f89", fg_subtle: "#848cb5",
+            accent: "#2e7de9", red: "#f52a65", green: "#587539",
+            yellow: "#8c6c3e", blue: "#2e7de9", magenta: "#9854f1", cyan: "#007197",
+        }
+        .into()
+    }
+
+    pub fn iceberg_light() -> Self {
+        Palette {
+            name: "Iceberg Light",
+            description: "Pale blue-grey, the light Iceberg variant",
+            bg: "#e8e9ec", bg_alt: "#dcdfe7", bg_sel: "#cad0de",
+            fg: "#33374c", fg_dim: "#575f78", fg_subtle: "#8389a3",
+            accent: "#2d539e", red: "#cc517a", green: "#668e3d",
+            yellow: "#c57339", blue: "#2d539e", magenta: "#7759b4", cyan: "#3f83a6",
+        }
+        .into()
+    }
+
     pub fn all_presets() -> Vec<Theme> {
-        vec![
+        let mut presets = vec![
             Self::ratarss_dark(),
             Self::ratarss_light(),
             Self::catppuccin_mocha(),
@@ -2016,7 +2352,49 @@ impl Theme {
             Self::cyberpunk_neon(),
             Self::horizon(),
             Self::minimal_mono(),
-        ]
+            Self::ayu_dark(),
+            Self::ayu_mirage(),
+            Self::material_ocean(),
+            Self::zenburn(),
+            Self::iceberg(),
+            Self::oxocarbon(),
+            Self::melange_dark(),
+            Self::poimandres(),
+            Self::vesper(),
+            Self::flexoki_dark(),
+            Self::tokyo_night_moon(),
+            Self::gruvbox_material(),
+            Self::nightfox(),
+            Self::ayu_light(),
+            Self::papercolor_light(),
+            Self::flexoki_light(),
+            Self::melange_light(),
+            Self::tokyo_night_day(),
+            Self::iceberg_light(),
+        ];
+
+        // Light themes go last. Judged by the background's luminance rather
+        // than by name, so a theme is classified by how it actually looks and
+        // nothing has to be kept in a parallel list.
+        //
+        // `sort_by_key` is stable, so the curated order within each group holds.
+        presets.sort_by_key(|t| t.is_light());
+        presets
+    }
+
+    /// Whether this theme reads as a light theme, from the perceived luminance
+    /// of its background.
+    pub fn is_light(&self) -> bool {
+        fn channel(hex: &str, at: usize) -> f32 {
+            u8::from_str_radix(hex.get(at..at + 2).unwrap_or("00"), 16).unwrap_or(0) as f32 / 255.0
+        }
+        let hex = self.config.bg.trim_start_matches('#');
+        if hex.len() < 6 {
+            return false;
+        }
+        // Rec. 709 luma; 0.5 splits every bundled palette correctly.
+        let luma = 0.2126 * channel(hex, 0) + 0.7152 * channel(hex, 2) + 0.0722 * channel(hex, 4);
+        luma > 0.5
     }
 
     pub fn by_name(name: &str) -> Self {

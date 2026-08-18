@@ -16,6 +16,20 @@ pub struct SidebarView<'a> {
     pub scroll_offset: usize,
     pub show_icons: bool,
     pub padding: u16,
+    pub search_query: &'a str,
+    pub is_searching: bool,
+}
+
+impl<'a> SidebarView<'a> {
+    /// Rows the search bar occupies at the top of the pane, which the click
+    /// handler has to skip over.
+    pub fn search_rows(is_searching: bool, query: &str) -> u16 {
+        if is_searching || !query.is_empty() {
+            2
+        } else {
+            0
+        }
+    }
 }
 
 impl<'a> Widget for SidebarView<'a> {
@@ -52,6 +66,44 @@ impl<'a> Widget for SidebarView<'a> {
         let pad = self.padding.min(inner_area.width.saturating_sub(1) / 2);
         let text_x = inner_area.x + pad;
         let text_width = inner_area.width.saturating_sub(pad * 2);
+
+        let mut top = inner_area.y;
+        let max_y = inner_area.y + inner_area.height;
+
+        // Search bar, matching the article pane's.
+        if Self::search_rows(self.is_searching, self.search_query) > 0 && top < max_y {
+            let search_style = if self.is_searching {
+                Style::default().bg(self.theme.selection_bg).fg(self.theme.selection_fg)
+            } else {
+                Style::default().bg(self.theme.sidebar_bg).fg(self.theme.fg_dim)
+            };
+            buf.set_style(Rect::new(inner_area.x, top, inner_area.width, 1), search_style);
+
+            let prefix = if self.show_icons { " 🔍 " } else { " / " };
+            let text = format!(
+                "{prefix}{}{}",
+                self.search_query,
+                if self.is_searching { "█" } else { "" }
+            );
+            buf.set_string(inner_area.x, top, &text, search_style);
+            top += 1;
+
+            if top < max_y {
+                let sep = "─".repeat(inner_area.width as usize);
+                buf.set_string(inner_area.x, top, &sep, Style::default().fg(self.theme.border_inactive));
+                top += 1;
+            }
+        }
+
+        let inner_area = Rect {
+            x: inner_area.x,
+            y: top,
+            width: inner_area.width,
+            height: max_y.saturating_sub(top),
+        };
+        if inner_area.height == 0 {
+            return;
+        }
 
         let visible_height = inner_area.height as usize;
         let mut start_idx = self.scroll_offset;

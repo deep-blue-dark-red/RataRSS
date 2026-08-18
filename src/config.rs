@@ -4,7 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// `#[serde(default)]` at the container level: a config file missing any single
+/// binding used to fail to parse, and `AppConfig::load` reacts to a parse error
+/// by falling back to defaults for *everything* — so one absent line silently
+/// discarded the user's theme, layout and every other binding. Missing fields
+/// now fall back individually.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KeyBindingsConfig {
     pub quit: String,
     pub help: String,
@@ -14,7 +20,11 @@ pub struct KeyBindingsConfig {
     pub export_opml: String,
     pub delete_item: String,
     pub toggle_zen: String,
+    /// Fuzzy article search (default `ctrl+a`).
     pub search: String,
+    /// Fuzzy feed search in the sidebar (default `ctrl+f`).
+    #[serde(default = "default_search_feeds")]
+    pub search_feeds: String,
     pub refresh_current: String,
     pub refresh_all: String,
     pub toggle_read: String,
@@ -55,7 +65,8 @@ impl Default for KeyBindingsConfig {
             export_opml: "e".to_string(),
             delete_item: "d".to_string(),
             toggle_zen: "f, z".to_string(),
-            search: "ctrl+f, ctrl+s".to_string(),
+            search: "ctrl+a".to_string(),
+            search_feeds: default_search_feeds(),
             refresh_current: "r".to_string(),
             refresh_all: "R".to_string(),
             toggle_read: "m".to_string(),
@@ -83,6 +94,24 @@ impl Default for KeyBindingsConfig {
             resize_reader_inc: "+".to_string(),
             resize_reader_dec: "-".to_string(),
             reset_layout: "=".to_string(),
+        }
+    }
+}
+
+fn default_search_feeds() -> String {
+    "ctrl+f".to_string()
+}
+
+impl KeyBindingsConfig {
+    /// Move configs written before feed search onto the new defaults.
+    ///
+    /// `ctrl+f` used to mean "search articles" and now means "search feeds", so
+    /// a config still carrying the old default would leave the user with no
+    /// binding for article search at all. Only the untouched default is
+    /// migrated; a custom binding is left exactly as the user set it.
+    pub fn migrate(&mut self) {
+        if self.search == "ctrl+f, ctrl+s" {
+            self.search = "ctrl+a".to_string();
         }
     }
 }
@@ -185,6 +214,7 @@ fn single_key_matches(event: &KeyEvent, spec: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub theme: String,
 
@@ -270,7 +300,8 @@ impl AppConfig {
 
         if config_file.exists() {
             if let Ok(content) = fs::read_to_string(&config_file) {
-                if let Ok(config) = toml::from_str::<AppConfig>(&content) {
+                if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
+                    config.keybindings.migrate();
                     return config;
                 }
             }
