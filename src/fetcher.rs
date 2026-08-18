@@ -19,7 +19,9 @@ impl Default for FeedFetcher {
 impl FeedFetcher {
     pub fn new() -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(12))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(8))
+            .redirect(reqwest::redirect::Policy::limited(5))
             .user_agent("ratarss/0.1.0 (https://github.com/ratarss/ratarss; RSS reader)")
             .build()
             .unwrap_or_else(|_| Client::new());

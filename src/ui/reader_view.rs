@@ -1,7 +1,6 @@
 use crate::model::{ActivePane, Article};
 use crate::reader::render_article_to_text;
 use crate::theme::Theme;
-use crate::ui::widgets::ProgressBarWidget;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -90,31 +89,16 @@ impl<'a> Widget for ReaderView<'a> {
             }
         }
 
-        // Bottom Progress Bar
+        // Bottom Position Indicator (e.g. Line 1/18)
         if total_lines > 0 && inner_area.height > 1 {
-            let progress = if total_lines <= visible_lines {
-                1.0
-            } else {
-                (start_line as f64) / ((total_lines.saturating_sub(visible_lines)) as f64)
-            };
-
-            let progress_widget = ProgressBarWidget {
-                progress,
-                width: 14,
-                theme: self.theme.clone(),
-            };
-
-            let progress_line = progress_widget.to_line();
             let progress_y = inner_area.y + inner_area.height - 1;
-            let current_pos_info = format!("Line {}/{} ", start_line + 1, total_lines);
-            let pos_span = Span::styled(current_pos_info, Style::default().fg(self.theme.fg_subtle));
-
-            let mut footer_spans = progress_line.spans;
-            footer_spans.insert(0, pos_span);
-            footer_spans.insert(0, Span::raw(" "));
-            let footer_line = Line::from(footer_spans);
-
-            let footer_width = unicode_width::UnicodeWidthStr::width(footer_line.to_string().as_str()) as u16;
+            let current_pos_info = format!(" Line {}/{} ", start_line + 1, total_lines);
+            let pos_span = Span::styled(
+                current_pos_info.clone(),
+                Style::default().fg(self.theme.fg_subtle),
+            );
+            let footer_line = Line::from(vec![pos_span]);
+            let footer_width = unicode_width::UnicodeWidthStr::width(current_pos_info.as_str()) as u16;
             if inner_area.width > footer_width + 4 {
                 let footer_x = inner_area.x + inner_area.width - footer_width - 2;
                 buf.set_line(footer_x, progress_y, &footer_line, footer_width);

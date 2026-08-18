@@ -103,10 +103,15 @@ impl<'a> Widget for ArticleListView<'a> {
             return;
         }
 
-        // Each card takes 3 lines + 1 optional divider line (or 3 lines compact)
+        // Each card takes 3 lines
         let card_height = 3;
         let visible_cards = ((max_y.saturating_sub(current_y)) / card_height as u16) as usize;
-        let start_idx = self.scroll_offset;
+        let mut start_idx = self.scroll_offset;
+        if self.selected_index < start_idx {
+            start_idx = self.selected_index;
+        } else if visible_cards > 0 && self.selected_index >= start_idx + visible_cards {
+            start_idx = self.selected_index + 1 - visible_cards;
+        }
         let end_idx = (start_idx + visible_cards + 1).min(self.articles.len());
 
         let mut y = current_y;

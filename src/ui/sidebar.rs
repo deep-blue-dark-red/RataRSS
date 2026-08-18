@@ -46,7 +46,12 @@ impl<'a> Widget for SidebarView<'a> {
         }
 
         let visible_height = inner_area.height as usize;
-        let start_idx = self.scroll_offset;
+        let mut start_idx = self.scroll_offset;
+        if self.selected_index < start_idx {
+            start_idx = self.selected_index;
+        } else if visible_height > 0 && self.selected_index >= start_idx + visible_height {
+            start_idx = self.selected_index + 1 - visible_height;
+        }
         let end_idx = (start_idx + visible_height).min(self.items.len());
 
         for (row_offset, idx) in (start_idx..end_idx).enumerate() {

@@ -7,7 +7,9 @@ pub mod widgets;
 use crate::app::App;
 use crate::model::ActivePane;
 use crate::ui::article_list::ArticleListView;
-use crate::ui::modals::{AddFeedModal, ConfirmDeleteModal, ExportOpmlModal, HelpModal, ThemePickerModal};
+use crate::ui::modals::{
+    AddFeedModal, ConfigMenuModal, ConfirmDeleteModal, ExportOpmlModal, HelpModal, ThemePickerModal,
+};
 use crate::ui::reader_view::ReaderView;
 use crate::ui::sidebar::SidebarView;
 use crate::ui::widgets::get_spinner_frame;
@@ -16,7 +18,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
-
 
 pub fn render_app(app: &App, frame: &mut Frame) {
     let area = frame.area();
@@ -133,7 +134,16 @@ pub fn render_app(app: &App, frame: &mut Frame) {
     render_status_bar(app, status_bar_area, frame.buffer_mut());
 
     // --- Render Active Modals / Overlays ---
-    if app.show_add_modal {
+    if app.show_config_modal {
+        let modal = ConfigMenuModal {
+            config: &app.config,
+            selected_index: app.config_menu_selected_idx,
+            subview: app.config_menu_subview,
+            keybind_selected_idx: app.config_keybind_selected_idx,
+            theme,
+        };
+        frame.render_widget(modal, area);
+    } else if app.show_add_modal {
         let modal = AddFeedModal {
             url_input: &app.modal_url_input,
             folder_input: &app.modal_folder_input,
@@ -181,12 +191,11 @@ fn render_header_bar(app: &App, area: Rect, buf: &mut Buffer) {
         buf.set_style(Rect::new(x, area.y, 1, 1), bg_style);
     }
 
-    // App Brand / Title
+    // App Brand / Title - RataRSS with no background badge so contrast is crisp and clean
     let app_brand = Span::styled(
-        " 📰 NetNewsWire ",
+        " 📰 RataRSS ",
         Style::default()
-            .bg(theme.accent)
-            .fg(theme.selection_fg)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -208,9 +217,9 @@ fn render_header_bar(app: &App, area: Rect, buf: &mut Buffer) {
     buf.set_line(area.x, area.y, &left_line, area.width);
 
     // Right quick shortcuts
-    let shortcuts = " [?] Help  [T] Theme  [a] Add Feed  [r] Refresh  [f] Fullscreen  [q] Quit ";
+    let shortcuts = " [?] Help  [/] Config  [T] Themes  [a] Add  [r] Refresh  [f] Zen  [q] Quit ";
     let short_len = shortcuts.len() as u16;
-    if area.width > short_len + 30 {
+    if area.width > short_len + 28 {
         let right_x = area.x + area.width - short_len;
         buf.set_string(
             right_x,
@@ -234,9 +243,9 @@ fn render_status_bar(app: &App, area: Rect, buf: &mut Buffer) {
         format!(" 📢 {msg} ")
     } else {
         match app.active_pane {
-            ActivePane::Sidebar => " [1: Feeds] Tab/L to Articles • j/k to navigate • Enter to select • a Add • d Delete".to_string(),
-            ActivePane::ArticleList => " [2: Articles] Tab/L to Reader • j/k to browse • m Toggle Read • s Star • / Search".to_string(),
-            ActivePane::Reader => " [3: Reader] j/k/Space to Scroll • o Open in Browser • y Copy URL • f Fullscreen".to_string(),
+            ActivePane::Sidebar => " [1: Feeds] Tab to Articles • j/k navigate • Enter select • a Add • d Delete • / Config".to_string(),
+            ActivePane::ArticleList => " [2: Articles] Tab to Reader • j/k browse • m Read • s Star • Ctrl+F Search • / Config".to_string(),
+            ActivePane::Reader => " [3: Reader] j/k/Space Scroll • o Browser • y Copy • f Zen • / Config".to_string(),
         }
     };
 

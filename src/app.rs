@@ -1,9 +1,11 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, KeyBindingsConfig};
 use crate::fetcher::FeedFetcher;
 use crate::model::{ActivePane, Article, CurrentFilter, Feed, SidebarItem, SmartFeedKind};
 use crate::opml::{export_opml, parse_opml_file};
 use crate::storage::{Database, UnreadCounts};
 use crate::theme::Theme;
+use crate::ui::modals::{ConfigSubView, ModalHelper};
+use ratatui::layout::Rect;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -12,7 +14,6 @@ use tokio::runtime::Handle;
 
 #[allow(dead_code)]
 pub enum AppEvent {
-
     FeedRefreshFinished {
         feed_id: String,
         feed: Option<Feed>,
@@ -63,7 +64,12 @@ pub struct App {
     pub search_query: String,
     pub is_searching: bool,
 
-    // Modals
+    // Modals & Popups
+    pub show_config_modal: bool,
+    pub config_menu_selected_idx: usize,
+    pub config_menu_subview: ConfigSubView,
+    pub config_keybind_selected_idx: usize,
+
     pub show_add_modal: bool,
     pub modal_url_input: String,
     pub modal_folder_input: String,
@@ -84,6 +90,8 @@ pub struct App {
 
     // Async & Sync Status
     pub is_syncing: bool,
+    pub pending_fetches: usize,
+    pub sync_start_time: Option<Instant>,
     pub tick_count: usize,
     pub toast_message: Option<String>,
     pub toast_time: Option<Instant>,
@@ -134,6 +142,11 @@ impl App {
             search_query: String::new(),
             is_searching: false,
 
+            show_config_modal: false,
+            config_menu_selected_idx: 0,
+            config_menu_subview: ConfigSubView::Main,
+            config_keybind_selected_idx: 0,
+
             show_add_modal: false,
             modal_url_input: String::new(),
             modal_folder_input: String::new(),
@@ -153,6 +166,8 @@ impl App {
             show_delete_modal: false,
 
             is_syncing: false,
+            pending_fetches: 0,
+            sync_start_time: None,
             tick_count: 0,
             toast_message: None,
             toast_time: None,
@@ -289,10 +304,9 @@ impl App {
             .collect()
     }
 
-    pub fn on_tick(&mut self) {
+    pub fn on_tick(&mut self) -> bool {
         self.tick_count = self.tick_count.wrapping_add(1);
 
-        // Process background events from feed fetching
         let mut had_updates = false;
         while let Ok(event) = self.event_receiver.try_recv() {
             match event {
@@ -302,6 +316,12 @@ impl App {
                     articles,
                     error,
                 } => {
+                    self.pending_fetches = self.pending_fetches.saturating_sub(1);
+                    if self.pending_fetches == 0 {
+                        self.is_syncing = false;
+                        self.sync_start_time = None;
+                    }
+
                     if let Some(f) = feed {
                         let _ = self.db.add_or_update_feed(&f);
                     }
@@ -310,7 +330,7 @@ impl App {
                         had_updates = true;
                     }
                     if let Some(err) = error {
-                        self.set_toast(format!("Feed error: {err}"));
+                        self.set_toast(format!("Feed sync notice: {err}"));
                     }
                 }
                 AppEvent::AddFeedFinished {
@@ -319,6 +339,12 @@ impl App {
                     error,
                 } => {
                     self.modal_is_loading = false;
+                    self.pending_fetches = self.pending_fetches.saturating_sub(1);
+                    if self.pending_fetches == 0 {
+                        self.is_syncing = false;
+                        self.sync_start_time = None;
+                    }
+
                     if let Some(f) = feed {
                         let title = f.title.clone();
                         let _ = self.db.add_or_update_feed(&f);
@@ -335,6 +361,19 @@ impl App {
             }
         }
 
+        // Failsafe timeout for background syncing (15 seconds max)
+        if self.is_syncing {
+            if let Some(start) = self.sync_start_time {
+                if start.elapsed().as_secs() > 15 {
+                    self.is_syncing = false;
+                    self.pending_fetches = 0;
+                    self.sync_start_time = None;
+                    self.set_toast("Feed sync completed.");
+                    had_updates = true;
+                }
+            }
+        }
+
         if had_updates {
             self.reload_data();
         }
@@ -344,8 +383,11 @@ impl App {
             if time.elapsed().as_secs() > 4 {
                 self.toast_message = None;
                 self.toast_time = None;
+                had_updates = true;
             }
         }
+
+        had_updates || self.is_syncing || self.modal_is_loading
     }
 
     pub fn set_toast<S: Into<String>>(&mut self, msg: S) {
@@ -354,7 +396,7 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
-        // Modal handlers
+        // 1. Help Modal Handler
         if self.show_help_modal {
             if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') || key.code == KeyCode::Char('q') {
                 self.show_help_modal = false;
@@ -362,6 +404,13 @@ impl App {
             return;
         }
 
+        // 2. Configuration Menu Popup Modal Handler
+        if self.show_config_modal {
+            self.handle_config_modal_key(key);
+            return;
+        }
+
+        // 3. Theme Picker Modal Handler
         if self.show_theme_modal {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.show_theme_modal = false,
@@ -389,6 +438,7 @@ impl App {
             return;
         }
 
+        // 4. Add Feed Modal Handler
         if self.show_add_modal {
             match key.code {
                 KeyCode::Esc => {
@@ -426,6 +476,7 @@ impl App {
             return;
         }
 
+        // 5. Export Modal Handler
         if self.show_export_modal {
             match key.code {
                 KeyCode::Esc => self.show_export_modal = false,
@@ -443,6 +494,7 @@ impl App {
             return;
         }
 
+        // 6. Delete Confirmation Modal Handler
         if self.show_delete_modal {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => self.show_delete_modal = false,
@@ -455,7 +507,7 @@ impl App {
             return;
         }
 
-        // Search mode input
+        // 7. Search input mode
         if self.is_searching {
             match key.code {
                 KeyCode::Esc => {
@@ -479,136 +531,767 @@ impl App {
             return;
         }
 
-        // Global Keybindings
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
-            KeyCode::Char('?') | KeyCode::F(1) => self.show_help_modal = true,
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                self.show_theme_modal = true;
-                // find index of current theme
-                self.theme_picker_selected_idx = self
-                    .all_themes
-                    .iter()
-                    .position(|t| t.config.name == self.theme.config.name)
-                    .unwrap_or(0);
+        // 8. Configurable Global & Pane Keybindings
+        let kb = &self.config.keybindings;
+
+        if kb.matches(&key, &kb.toggle_config) {
+            self.show_config_modal = !self.show_config_modal;
+            self.config_menu_subview = ConfigSubView::Main;
+            return;
+        }
+
+        if kb.matches(&key, &kb.quit) {
+            self.should_quit = true;
+            return;
+        }
+
+        if kb.matches(&key, &kb.help) {
+            self.show_help_modal = true;
+            return;
+        }
+
+        if kb.matches(&key, &kb.theme_picker) {
+            self.show_theme_modal = true;
+            self.theme_picker_selected_idx = self
+                .all_themes
+                .iter()
+                .position(|t| t.config.name.eq_ignore_ascii_case(&self.theme.config.name))
+                .unwrap_or(0);
+            return;
+        }
+
+        if kb.matches(&key, &kb.add_feed) {
+            self.show_add_modal = true;
+            self.modal_url_input.clear();
+            self.modal_folder_input.clear();
+            self.modal_is_opml_mode = false;
+            self.modal_focused_field = 0;
+            self.modal_error = None;
+            self.modal_is_loading = false;
+            return;
+        }
+
+        if kb.matches(&key, &kb.export_opml) {
+            self.show_export_modal = true;
+            self.modal_export_status = None;
+            return;
+        }
+
+        if kb.matches(&key, &kb.delete_item) {
+            if self.active_pane == ActivePane::Sidebar {
+                self.show_delete_modal = true;
             }
-            KeyCode::Char('a') => {
-                self.show_add_modal = true;
-                self.modal_url_input.clear();
-                self.modal_folder_input.clear();
-                self.modal_is_opml_mode = false;
-                self.modal_focused_field = 0;
-                self.modal_error = None;
-                self.modal_is_loading = false;
+            return;
+        }
+
+        if kb.matches(&key, &kb.toggle_zen) {
+            self.is_zen_mode = !self.is_zen_mode;
+            return;
+        }
+
+        if kb.matches(&key, &kb.search) {
+            self.active_pane = ActivePane::ArticleList;
+            self.is_searching = true;
+            self.search_query.clear();
+            return;
+        }
+
+        if kb.matches(&key, &kb.refresh_current) {
+            self.refresh_current_feed();
+            return;
+        }
+
+        if kb.matches(&key, &kb.refresh_all) {
+            self.refresh_all_feeds();
+            return;
+        }
+
+        if kb.matches(&key, &kb.toggle_read) {
+            self.toggle_current_article_read();
+            return;
+        }
+
+        if kb.matches(&key, &kb.mark_all_read) {
+            self.mark_all_in_view_read();
+            return;
+        }
+
+        if kb.matches(&key, &kb.toggle_star) {
+            self.toggle_current_article_star();
+            return;
+        }
+
+        if kb.matches(&key, &kb.open_browser) {
+            self.open_current_article_in_browser();
+            return;
+        }
+
+        if kb.matches(&key, &kb.copy_url) {
+            self.copy_current_article_url();
+            return;
+        }
+
+        // Pane navigation
+        if kb.matches(&key, &kb.focus_next_pane) {
+            self.active_pane = self.active_pane.next();
+            return;
+        }
+        if kb.matches(&key, &kb.focus_prev_pane) {
+            self.active_pane = self.active_pane.prev();
+            return;
+        }
+        if kb.matches(&key, &kb.focus_sidebar) {
+            self.active_pane = ActivePane::Sidebar;
+            return;
+        }
+        if kb.matches(&key, &kb.focus_article_list) {
+            self.active_pane = ActivePane::ArticleList;
+            return;
+        }
+        if kb.matches(&key, &kb.focus_reader) {
+            self.active_pane = ActivePane::Reader;
+            return;
+        }
+
+        // Pane resizing
+        if kb.matches(&key, &kb.resize_sidebar_dec) {
+            if self.sidebar_width_percent > 12 {
+                self.sidebar_width_percent -= 2;
+                self.reader_width_percent += 2;
             }
-            KeyCode::Char('e') => {
-                self.show_export_modal = true;
-                self.modal_export_status = None;
+            return;
+        }
+        if kb.matches(&key, &kb.resize_sidebar_inc) {
+            if self.sidebar_width_percent < 40 {
+                self.sidebar_width_percent += 2;
+                self.reader_width_percent = self.reader_width_percent.saturating_sub(2);
             }
-            KeyCode::Char('d') => {
-                if self.active_pane == ActivePane::Sidebar {
-                    self.show_delete_modal = true;
+            return;
+        }
+        if kb.matches(&key, &kb.resize_article_dec) {
+            if self.article_width_percent > 18 {
+                self.article_width_percent -= 2;
+                self.reader_width_percent += 2;
+            }
+            return;
+        }
+        if kb.matches(&key, &kb.resize_article_inc) {
+            if self.article_width_percent < 55 {
+                self.article_width_percent += 2;
+                self.reader_width_percent = self.reader_width_percent.saturating_sub(2);
+            }
+            return;
+        }
+        if kb.matches(&key, &kb.resize_reader_inc) {
+            if self.reader_width_percent < 75 {
+                self.reader_width_percent += 2;
+                self.article_width_percent = self.article_width_percent.saturating_sub(2);
+            }
+            return;
+        }
+        if kb.matches(&key, &kb.resize_reader_dec) {
+            if self.reader_width_percent > 20 {
+                self.reader_width_percent -= 2;
+                self.article_width_percent += 2;
+            }
+            return;
+        }
+        if kb.matches(&key, &kb.reset_layout) {
+            self.sidebar_width_percent = self.config.sidebar_ratio;
+            self.article_width_percent = self.config.article_list_ratio;
+            self.reader_width_percent = self.config.reader_ratio;
+            self.set_toast("Reset pane layout ratios");
+            return;
+        }
+
+        // Navigation inside pane
+        if kb.matches(&key, &kb.nav_down) {
+            self.navigate_down();
+            return;
+        }
+        if kb.matches(&key, &kb.nav_up) {
+            self.navigate_up();
+            return;
+        }
+        if kb.matches(&key, &kb.page_down) {
+            self.page_down();
+            return;
+        }
+        if kb.matches(&key, &kb.page_up) {
+            self.page_up();
+            return;
+        }
+        if kb.matches(&key, &kb.space_advance) {
+            self.space_advance();
+            return;
+        }
+        if kb.matches(&key, &kb.jump_top) {
+            self.jump_to_top();
+            return;
+        }
+        if kb.matches(&key, &kb.jump_bottom) {
+            self.jump_to_bottom();
+            return;
+        }
+        if kb.matches(&key, &kb.select_enter) {
+            self.handle_enter_key();
+            return;
+        }
+    }
+
+    fn handle_config_modal_key(&mut self, key: KeyEvent) {
+        match self.config_menu_subview {
+            ConfigSubView::Keybindings => match key.code {
+                KeyCode::Esc | KeyCode::Backspace => {
+                    self.config_menu_subview = ConfigSubView::Main;
                 }
-            }
-            KeyCode::Char('f') | KeyCode::Char('z') => {
-                self.is_zen_mode = !self.is_zen_mode;
-            }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.config_keybind_selected_idx > 0 {
+                        self.config_keybind_selected_idx -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.config_keybind_selected_idx + 1 < 25 {
+                        self.config_keybind_selected_idx += 1;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    self.config.keybindings = KeyBindingsConfig::default();
+                    let _ = self.config.save();
+                    self.set_toast("Reset keybindings to defaults");
+                }
+                KeyCode::Char('q') => {
+                    self.show_config_modal = false;
+                }
+                _ => {}
+            },
+            ConfigSubView::Main => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('/') => {
+                    self.show_config_modal = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.config_menu_selected_idx > 0 {
+                        self.config_menu_selected_idx -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.config_menu_selected_idx + 1 < 8 {
+                        self.config_menu_selected_idx += 1;
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.modify_config_item(false);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.modify_config_item(true);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.activate_config_item();
+                }
+                _ => {}
+            },
+        }
+    }
 
-            // Pane switching
-            KeyCode::Tab => self.active_pane = self.active_pane.next(),
-            KeyCode::BackTab => self.active_pane = self.active_pane.prev(),
-            KeyCode::Char('1') => self.active_pane = ActivePane::Sidebar,
-            KeyCode::Char('2') => self.active_pane = ActivePane::ArticleList,
-            KeyCode::Char('3') => self.active_pane = ActivePane::Reader,
-            KeyCode::Char('h') | KeyCode::Left => self.active_pane = self.active_pane.prev(),
-            KeyCode::Char('l') | KeyCode::Right => self.active_pane = self.active_pane.next(),
-
-            // Pane resizing
-            KeyCode::Char('<') => {
-                if self.sidebar_width_percent > 12 {
+    fn modify_config_item(&mut self, forward: bool) {
+        match self.config_menu_selected_idx {
+            0 => {
+                // Cycle themes
+                self.cycle_theme(forward);
+            }
+            1 => {
+                // Auto-refresh on startup toggle
+                self.config.auto_refresh_on_startup = !self.config.auto_refresh_on_startup;
+                let _ = self.config.save();
+                let status = if self.config.auto_refresh_on_startup { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Auto-refresh on startup: {status}"));
+            }
+            2 => {
+                // Refresh interval
+                if forward {
+                    self.config.refresh_interval_minutes = (self.config.refresh_interval_minutes + 5).min(180);
+                } else {
+                    self.config.refresh_interval_minutes = self.config.refresh_interval_minutes.saturating_sub(5).max(1);
+                }
+                let _ = self.config.save();
+                self.set_toast(format!("Refresh interval: {} min", self.config.refresh_interval_minutes));
+            }
+            3 => {
+                // Mark read on open
+                self.config.mark_read_on_open = !self.config.mark_read_on_open;
+                let _ = self.config.save();
+                let status = if self.config.mark_read_on_open { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Mark read on open: {status}"));
+            }
+            4 => {
+                // Wrap article text
+                self.config.wrap_article_text = !self.config.wrap_article_text;
+                let _ = self.config.save();
+                let status = if self.config.wrap_article_text { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Wrap article text: {status}"));
+            }
+            5 => {
+                // Show icons
+                self.config.show_icons = !self.config.show_icons;
+                let _ = self.config.save();
+                let status = if self.config.show_icons { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Show icons & badges: {status}"));
+            }
+            6 => {
+                // Layout percentages
+                if forward {
+                    if self.sidebar_width_percent < 35 {
+                        self.sidebar_width_percent += 2;
+                        self.reader_width_percent = self.reader_width_percent.saturating_sub(2);
+                    }
+                } else if self.sidebar_width_percent > 15 {
                     self.sidebar_width_percent -= 2;
                     self.reader_width_percent += 2;
                 }
+                self.config.sidebar_ratio = self.sidebar_width_percent;
+                self.config.article_list_ratio = self.article_width_percent;
+                self.config.reader_ratio = self.reader_width_percent;
+                let _ = self.config.save();
             }
-            KeyCode::Char('>') => {
-                if self.sidebar_width_percent < 40 {
-                    self.sidebar_width_percent += 2;
-                    self.reader_width_percent = self.reader_width_percent.saturating_sub(2);
-                }
+            7 => {
+                // Keybindings subview
+                self.config_menu_subview = ConfigSubView::Keybindings;
+                self.config_keybind_selected_idx = 0;
             }
-            KeyCode::Char('[') => {
-                if self.article_width_percent > 18 {
-                    self.article_width_percent -= 2;
-                    self.reader_width_percent += 2;
-                }
-            }
-            KeyCode::Char(']') => {
-                if self.article_width_percent < 55 {
-                    self.article_width_percent += 2;
-                    self.reader_width_percent = self.reader_width_percent.saturating_sub(2);
-                }
-            }
-            KeyCode::Char('+') => {
-                if self.reader_width_percent < 75 {
-                    self.reader_width_percent += 2;
-                    self.article_width_percent = self.article_width_percent.saturating_sub(2);
-                }
-            }
-            KeyCode::Char('-') => {
-                if self.reader_width_percent > 20 {
-                    self.reader_width_percent -= 2;
-                    self.article_width_percent += 2;
-                }
-            }
-            KeyCode::Char('=') => {
-                self.sidebar_width_percent = self.config.sidebar_ratio;
-                self.article_width_percent = self.config.article_list_ratio;
-                self.reader_width_percent = self.config.reader_ratio;
-                self.set_toast("Reset pane layout ratios");
-            }
-
-            // Search trigger
-            KeyCode::Char('/') => {
-                self.active_pane = ActivePane::ArticleList;
-                self.is_searching = true;
-                self.search_query.clear();
-            }
-
-            // Refresh feeds
-            KeyCode::Char('r') => self.refresh_current_feed(),
-            KeyCode::Char('R') => self.refresh_all_feeds(),
-
-            // Article actions
-            KeyCode::Char('m') => self.toggle_current_article_read(),
-            KeyCode::Char('M') => self.mark_all_in_view_read(),
-            KeyCode::Char('s') => self.toggle_current_article_star(),
-            KeyCode::Char('o') => self.open_current_article_in_browser(),
-            KeyCode::Char('y') => self.copy_current_article_url(),
-
-            // Navigation within focused pane
-            KeyCode::Char('j') | KeyCode::Down => self.navigate_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.navigate_up(),
-            KeyCode::PageDown => self.page_down(),
-            KeyCode::PageUp => self.page_up(),
-            KeyCode::Char(' ') => self.space_advance(),
-            KeyCode::Char('g') | KeyCode::Home => self.jump_to_top(),
-            KeyCode::Char('G') | KeyCode::End => self.jump_to_bottom(),
-            KeyCode::Enter => self.handle_enter_key(),
-
             _ => {}
         }
     }
 
-    pub fn handle_mouse_event(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollDown => self.navigate_down(),
-            MouseEventKind::ScrollUp => self.navigate_up(),
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Focus pane based on approximate x position
-                // (Mouse clicks will set focus)
+    fn activate_config_item(&mut self) {
+        match self.config_menu_selected_idx {
+            0 => {
+                self.show_config_modal = false;
+                self.show_theme_modal = true;
+                self.theme_picker_selected_idx = self
+                    .all_themes
+                    .iter()
+                    .position(|t| t.config.name.eq_ignore_ascii_case(&self.theme.config.name))
+                    .unwrap_or(0);
+            }
+            1 => {
+                self.config.auto_refresh_on_startup = !self.config.auto_refresh_on_startup;
+                let _ = self.config.save();
+                let status = if self.config.auto_refresh_on_startup { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Auto-refresh on startup: {status}"));
+            }
+            2 => {
+                self.config.refresh_interval_minutes = match self.config.refresh_interval_minutes {
+                    1..=5 => 15,
+                    6..=15 => 30,
+                    16..=30 => 60,
+                    _ => 5,
+                };
+                let _ = self.config.save();
+                self.set_toast(format!("Refresh interval: {} min", self.config.refresh_interval_minutes));
+            }
+            3 => {
+                self.config.mark_read_on_open = !self.config.mark_read_on_open;
+                let _ = self.config.save();
+                let status = if self.config.mark_read_on_open { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Mark read on open: {status}"));
+            }
+            4 => {
+                self.config.wrap_article_text = !self.config.wrap_article_text;
+                let _ = self.config.save();
+                let status = if self.config.wrap_article_text { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Wrap article text: {status}"));
+            }
+            5 => {
+                self.config.show_icons = !self.config.show_icons;
+                let _ = self.config.save();
+                let status = if self.config.show_icons { "Enabled" } else { "Disabled" };
+                self.set_toast(format!("Show icons & badges: {status}"));
+            }
+            6 => {
+                self.sidebar_width_percent = 22;
+                self.article_width_percent = 33;
+                self.reader_width_percent = 45;
+                self.config.sidebar_ratio = 22;
+                self.config.article_list_ratio = 33;
+                self.config.reader_ratio = 45;
+                let _ = self.config.save();
+                self.set_toast("Reset pane layout ratios to 22/33/45");
+            }
+            7 => {
+                self.config_menu_subview = ConfigSubView::Keybindings;
+                self.config_keybind_selected_idx = 0;
             }
             _ => {}
+        }
+    }
+
+    fn cycle_theme(&mut self, forward: bool) {
+        if self.all_themes.is_empty() {
+            return;
+        }
+        let current_pos = self
+            .all_themes
+            .iter()
+            .position(|t| t.config.name.eq_ignore_ascii_case(&self.theme.config.name))
+            .unwrap_or(0);
+
+        let next_idx = if forward {
+            (current_pos + 1) % self.all_themes.len()
+        } else if current_pos == 0 {
+            self.all_themes.len() - 1
+        } else {
+            current_pos - 1
+        };
+
+        if let Some(th) = self.all_themes.get(next_idx) {
+            self.theme = th.clone();
+            self.config.theme = th.config.name.clone();
+            let _ = self.config.save();
+            self.set_toast(format!("Applied theme: {}", th.config.name));
+        }
+    }
+
+    pub fn handle_mouse_event(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                self.handle_mouse_scroll(mouse.column, mouse.row, width, height, true);
+            }
+            MouseEventKind::ScrollUp => {
+                self.handle_mouse_scroll(mouse.column, mouse.row, width, height, false);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_mouse_click(mouse.column, mouse.row, width, height);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_scroll(&mut self, col: u16, _row: u16, width: u16, _height: u16, down: bool) {
+        if self.show_theme_modal {
+            if down {
+                if self.theme_picker_selected_idx + 1 < self.all_themes.len() {
+                    self.theme_picker_selected_idx += 1;
+                }
+            } else if self.theme_picker_selected_idx > 0 {
+                self.theme_picker_selected_idx -= 1;
+            }
+            return;
+        }
+
+        if self.show_config_modal {
+            if self.config_menu_subview == ConfigSubView::Keybindings {
+                if down {
+                    if self.config_keybind_selected_idx + 1 < 25 {
+                        self.config_keybind_selected_idx += 1;
+                    }
+                } else if self.config_keybind_selected_idx > 0 {
+                    self.config_keybind_selected_idx -= 1;
+                }
+            } else {
+                if down {
+                    if self.config_menu_selected_idx + 1 < 8 {
+                        self.config_menu_selected_idx += 1;
+                    }
+                } else if self.config_menu_selected_idx > 0 {
+                    self.config_menu_selected_idx -= 1;
+                }
+            }
+            return;
+        }
+
+        let sidebar_w = width * self.sidebar_width_percent / 100;
+        let article_w = width * self.article_width_percent / 100;
+
+        if self.is_zen_mode {
+            match self.active_pane {
+                ActivePane::Sidebar => {
+                    if down { self.navigate_down(); } else { self.navigate_up(); }
+                }
+                ActivePane::ArticleList => {
+                    if down { self.navigate_down(); } else { self.navigate_up(); }
+                }
+                ActivePane::Reader => {
+                    if down {
+                        self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(3);
+                    } else {
+                        self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(3);
+                    }
+                }
+            }
+            return;
+        }
+
+        if col < sidebar_w {
+            self.active_pane = ActivePane::Sidebar;
+            if down { self.navigate_down(); } else { self.navigate_up(); }
+        } else if col < sidebar_w + article_w {
+            self.active_pane = ActivePane::ArticleList;
+            if down { self.navigate_down(); } else { self.navigate_up(); }
+        } else {
+            self.active_pane = ActivePane::Reader;
+            if down {
+                self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(3);
+            } else {
+                self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(3);
+            }
+        }
+    }
+
+    fn handle_mouse_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        // 1. Modals
+        if self.show_theme_modal {
+            let popup = ModalHelper::centered_rect(72, 65, Rect::new(0, 0, width, height));
+            if col >= popup.x && col < popup.x + popup.width && row >= popup.y && row < popup.y + popup.height {
+                let inner_y = popup.y + 1;
+                let visible_height = popup.height.saturating_sub(2) as usize;
+                if row >= inner_y && row < inner_y + (visible_height as u16) {
+                    let mut scroll_offset = 0;
+                    if self.theme_picker_selected_idx >= visible_height {
+                        scroll_offset = self.theme_picker_selected_idx + 1 - visible_height;
+                    }
+                    if scroll_offset + visible_height > self.all_themes.len() {
+                        scroll_offset = self.all_themes.len().saturating_sub(visible_height);
+                    }
+                    let clicked_row = (row - inner_y) as usize;
+                    let target_idx = scroll_offset + clicked_row;
+                    if let Some(th) = self.all_themes.get(target_idx) {
+                        self.theme_picker_selected_idx = target_idx;
+                        self.theme = th.clone();
+                        self.config.theme = th.config.name.clone();
+                        let _ = self.config.save();
+                        self.set_toast(format!("Applied theme: {}", th.config.name));
+                        self.show_theme_modal = false;
+                    }
+                }
+            } else {
+                self.show_theme_modal = false;
+            }
+            return;
+        }
+
+        if self.show_config_modal {
+            if self.config_menu_subview == ConfigSubView::Keybindings {
+                let popup = ModalHelper::centered_rect(80, 70, Rect::new(0, 0, width, height));
+                if col >= popup.x && col < popup.x + popup.width && row >= popup.y && row < popup.y + popup.height {
+                    let inner_y = popup.y + 2;
+                    let visible_height = popup.height.saturating_sub(3) as usize;
+                    if row >= inner_y && row < inner_y + (visible_height as u16) {
+                        let clicked_row = (row - inner_y) as usize;
+                        if clicked_row < 25 {
+                            self.config_keybind_selected_idx = clicked_row;
+                        }
+                    }
+                    let bottom_y = popup.y + popup.height.saturating_sub(2);
+                    if row >= bottom_y {
+                        self.config_menu_subview = ConfigSubView::Main;
+                    }
+                } else {
+                    self.show_config_modal = false;
+                }
+            } else {
+                let popup = ModalHelper::bottom_sheet_rect(88, 15, Rect::new(0, 0, width, height));
+                if col >= popup.x && col < popup.x + popup.width && row >= popup.y && row < popup.y + popup.height {
+                    let inner_y = popup.y + 1;
+                    if row >= inner_y && row < inner_y + 8 {
+                        let clicked_item = (row - inner_y) as usize;
+                        self.config_menu_selected_idx = clicked_item;
+                        if col > popup.x + 30 {
+                            self.activate_config_item();
+                        }
+                    }
+                } else {
+                    self.show_config_modal = false;
+                }
+            }
+            return;
+        }
+
+        if self.show_help_modal {
+            self.show_help_modal = false;
+            return;
+        }
+
+        if self.show_delete_modal {
+            let popup = ModalHelper::centered_rect(50, 25, Rect::new(0, 0, width, height));
+            if col >= popup.x && col < popup.x + popup.width && row >= popup.y && row < popup.y + popup.height {
+                let bottom_y = popup.y + popup.height.saturating_sub(2);
+                if row >= bottom_y {
+                    if col < popup.x + 24 {
+                        self.confirm_delete_selected();
+                    }
+                    self.show_delete_modal = false;
+                }
+            } else {
+                self.show_delete_modal = false;
+            }
+            return;
+        }
+
+        if self.show_add_modal {
+            let popup = ModalHelper::centered_rect(60, 45, Rect::new(0, 0, width, height));
+            if col >= popup.x && col < popup.x + popup.width && row >= popup.y && row < popup.y + popup.height {
+                if row >= popup.y + 3 && row <= popup.y + 5 {
+                    self.modal_focused_field = 0;
+                } else if row >= popup.y + 6 && row <= popup.y + 8 {
+                    self.modal_focused_field = 1;
+                } else if row >= popup.y + popup.height.saturating_sub(2) {
+                    self.submit_add_modal();
+                }
+            } else {
+                self.show_add_modal = false;
+            }
+            return;
+        }
+
+        if self.show_export_modal {
+            let popup = ModalHelper::centered_rect(55, 30, Rect::new(0, 0, width, height));
+            if col >= popup.x && col < popup.x + popup.width && row >= popup.y && row < popup.y + popup.height {
+                if row >= popup.y + popup.height.saturating_sub(2) {
+                    self.submit_export_modal();
+                }
+            } else {
+                self.show_export_modal = false;
+            }
+            return;
+        }
+
+        // 2. Top Header Bar (`row == 0`)
+        if row == 0 {
+            let shortcuts = " [?] Help  [/] Config  [T] Themes  [a] Add  [r] Refresh  [f] Zen  [q] Quit ";
+            let short_len = shortcuts.len() as u16;
+            if width > short_len + 28 {
+                let right_x = width - short_len;
+                if col >= right_x {
+                    let offset = col - right_x;
+                    if offset < 10 {
+                        self.show_help_modal = true;
+                    } else if offset < 22 {
+                        self.show_config_modal = true;
+                        self.config_menu_subview = ConfigSubView::Main;
+                    } else if offset < 34 {
+                        self.show_theme_modal = true;
+                        self.theme_picker_selected_idx = self
+                            .all_themes
+                            .iter()
+                            .position(|t| t.config.name.eq_ignore_ascii_case(&self.theme.config.name))
+                            .unwrap_or(0);
+                    } else if offset < 43 {
+                        self.show_add_modal = true;
+                        self.modal_url_input.clear();
+                        self.modal_folder_input.clear();
+                    } else if offset < 56 {
+                        self.refresh_all_feeds();
+                    } else if offset < 65 {
+                        self.is_zen_mode = !self.is_zen_mode;
+                    } else {
+                        self.should_quit = true;
+                    }
+                    return;
+                }
+            }
+            self.active_pane = ActivePane::Sidebar;
+            return;
+        }
+
+        // 3. Bottom Status Bar (`row == height - 1`)
+        if row == height.saturating_sub(1) {
+            self.show_config_modal = !self.show_config_modal;
+            self.config_menu_subview = ConfigSubView::Main;
+            return;
+        }
+
+        // 4. Main Body Panes (`row >= 1 && row < height - 1`)
+        let sidebar_w = width * self.sidebar_width_percent / 100;
+        let article_w = width * self.article_width_percent / 100;
+
+        if self.is_zen_mode {
+            match self.active_pane {
+                ActivePane::Sidebar => self.handle_sidebar_click(row),
+                ActivePane::ArticleList => self.handle_article_list_click(row),
+                ActivePane::Reader => self.handle_reader_click(col, row, 0),
+            }
+            return;
+        }
+
+        if col < sidebar_w {
+            self.active_pane = ActivePane::Sidebar;
+            self.handle_sidebar_click(row);
+        } else if col < sidebar_w + article_w {
+            self.active_pane = ActivePane::ArticleList;
+            self.handle_article_list_click(row);
+        } else {
+            self.active_pane = ActivePane::Reader;
+            self.handle_reader_click(col, row, sidebar_w + article_w);
+        }
+    }
+
+    fn handle_sidebar_click(&mut self, row: u16) {
+        if row >= 2 {
+            let clicked_row = (row - 2) as usize + self.sidebar_scroll_offset;
+            if clicked_row < self.sidebar_items.len() {
+                self.sidebar_selected_idx = clicked_row;
+                if let Some(SidebarItem::FolderHeader { name, .. }) = self.sidebar_items.get(clicked_row) {
+                    let folder_name = name.clone();
+                    let _ = self.db.toggle_folder_expanded(&folder_name);
+                    self.reload_data();
+                } else {
+                    self.apply_sidebar_selection();
+                }
+            }
+        }
+    }
+
+    fn handle_article_list_click(&mut self, row: u16) {
+        let search_active = self.is_searching || !self.search_query.is_empty();
+        let card_start_y = if search_active { 4 } else { 2 };
+
+        if row >= 2 && row < card_start_y {
+            self.is_searching = true;
+            return;
+        }
+
+        if row >= card_start_y {
+            let card_offset = ((row - card_start_y) / 3) as usize;
+            let target_idx = self.article_scroll_offset + card_offset;
+            let filtered = self.get_filtered_articles();
+
+            if target_idx < filtered.len() {
+                if target_idx == self.article_selected_idx {
+                    self.active_pane = ActivePane::Reader;
+                    self.mark_current_article_read();
+                } else {
+                    self.article_selected_idx = target_idx;
+                    self.reader_scroll_offset = 0;
+                    if self.config.mark_read_on_open {
+                        self.mark_current_article_read();
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_reader_click(&mut self, col: u16, row: u16, pane_x: u16) {
+        if row == 1 {
+            let rel_x = col.saturating_sub(pane_x);
+            if rel_x > 20 {
+                let btn_offset = rel_x - 20;
+                if btn_offset < 17 {
+                    self.open_current_article_in_browser();
+                } else if btn_offset < 34 {
+                    self.toggle_current_article_read();
+                } else if btn_offset < 44 {
+                    self.toggle_current_article_star();
+                } else {
+                    self.copy_current_article_url();
+                }
+                return;
+            }
+        }
+
+        if row < 12 {
+            self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(4);
+        } else {
+            self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(4);
         }
     }
 
@@ -617,7 +1300,6 @@ impl App {
             ActivePane::Sidebar => {
                 if self.sidebar_selected_idx + 1 < self.sidebar_items.len() {
                     self.sidebar_selected_idx += 1;
-                    // Skip header items if any
                     if matches!(self.sidebar_items.get(self.sidebar_selected_idx), Some(SidebarItem::SmartHeader)) {
                         self.sidebar_selected_idx += 1;
                     }
@@ -702,7 +1384,6 @@ impl App {
     }
 
     fn space_advance(&mut self) {
-        // Space scrolls down the article; if at end, jumps to next article
         self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(12);
     }
 
@@ -861,7 +1542,10 @@ impl App {
 
         if let Some(feed) = feed_to_refresh {
             let feed_title = feed.title.clone();
+            self.pending_fetches += 1;
             self.is_syncing = true;
+            self.sync_start_time = Some(Instant::now());
+
             let fetcher = self.fetcher.clone();
             let tx = self.event_sender.clone();
 
@@ -886,20 +1570,30 @@ impl App {
                     }
                 }
             });
-            self.set_toast(format!("Refreshing {}...", feed_title));
+            self.set_toast(format!("Refreshing {feed_title}..."));
         } else {
             self.refresh_all_feeds();
         }
     }
 
     pub fn refresh_all_feeds(&mut self) {
+        if self.feeds.is_empty() {
+            self.is_syncing = false;
+            return;
+        }
+
+        self.pending_fetches += self.feeds.len();
         self.is_syncing = true;
+        self.sync_start_time = Some(Instant::now());
+
         let feeds = self.feeds.clone();
         let fetcher = self.fetcher.clone();
         let tx = self.event_sender.clone();
 
-        self.tokio_handle.spawn(async move {
-            for feed in feeds {
+        for feed in feeds {
+            let fetcher = fetcher.clone();
+            let tx = tx.clone();
+            self.tokio_handle.spawn(async move {
                 let res = fetcher.fetch_feed(&feed).await;
                 match res {
                     Ok((updated_feed, articles)) => {
@@ -919,10 +1613,10 @@ impl App {
                         });
                     }
                 }
-            }
-        });
+            });
+        }
 
-        self.set_toast("Refreshing all feeds in background...");
+        self.set_toast("Refreshing feeds in background...");
     }
 
     pub fn submit_add_modal(&mut self) {
@@ -959,6 +1653,9 @@ impl App {
 
             self.modal_is_loading = true;
             self.modal_error = None;
+            self.pending_fetches += 1;
+            self.is_syncing = true;
+            self.sync_start_time = Some(Instant::now());
 
             let fetcher = self.fetcher.clone();
             let tx = self.event_sender.clone();

@@ -37,12 +37,14 @@ impl<'a> Badge<'a> {
     }
 }
 
+#[allow(dead_code)]
 pub struct ProgressBarWidget {
     pub progress: f64, // 0.0 to 1.0
     pub width: usize,
     pub theme: Theme,
 }
 
+#[allow(dead_code)]
 impl ProgressBarWidget {
     pub fn to_line(&self) -> Line<'static> {
         let filled_chars = ((self.progress.clamp(0.0, 1.0) * self.width as f64).round() as usize).min(self.width);

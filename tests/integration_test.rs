@@ -1,11 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use ratarss::opml::{export_opml, parse_opml_str};
-    use ratarss::model::Feed;
-    use ratarss::theme::Theme;
-    use ratarss::reader::render_article_to_text;
-    use ratarss::model::Article;
     use chrono::Utc;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratarss::config::{key_matches, AppConfig};
+    use ratarss::model::Article;
+    use ratarss::model::Feed;
+    use ratarss::opml::{export_opml, parse_opml_str};
+    use ratarss::reader::render_article_to_text;
+    use ratarss::theme::Theme;
 
     #[test]
     fn test_opml_roundtrip() {
@@ -38,16 +40,28 @@ mod tests {
     #[test]
     fn test_themes_load_correctly() {
         let presets = Theme::all_presets();
-        assert!(!presets.is_empty());
-        let dark = Theme::by_name("NetNewsWire Dark");
-        assert_eq!(dark.config.name, "NetNewsWire Dark");
+        assert!(presets.len() >= 25, "Should have 25+ rich presets");
+        let dark = Theme::by_name("RataRSS Dark");
+        assert_eq!(dark.config.name, "RataRSS Dark");
+        let mocha = Theme::by_name("Catppuccin Mocha");
+        assert_eq!(mocha.config.name, "Catppuccin Mocha");
         let tokyo = Theme::by_name("Tokyo Night");
         assert_eq!(tokyo.config.name, "Tokyo Night");
+        let rose = Theme::by_name("Rosé Pine");
+        assert_eq!(rose.config.name, "Rosé Pine");
+        let cyber = Theme::by_name("Cyberpunk Neon");
+        assert_eq!(cyber.config.name, "Cyberpunk Neon");
+        let solar = Theme::by_name("Solarized Dark");
+        assert_eq!(solar.config.name, "Solarized Dark");
+
+        // Verify backward compatibility aliases
+        let legacy_dark = Theme::by_name("NetNewsWire Dark");
+        assert_eq!(legacy_dark.config.name, "RataRSS Dark");
     }
 
     #[test]
     fn test_reader_rendering() {
-        let theme = Theme::netnewswire_dark();
+        let theme = Theme::ratarss_dark();
         let article = Article {
             id: "test-1".to_string(),
             feed_id: "test-feed".to_string(),
@@ -55,7 +69,10 @@ mod tests {
             title: "Rust 2026 Edition Released".to_string(),
             author: Some("Ferris".to_string()),
             summary: Some("Summary preview".to_string()),
-            content: Some("<p>Hello <strong>World</strong>!</p><blockquote>Quoted wisdom</blockquote>".to_string()),
+            content: Some(
+                "<p>Hello <strong>World</strong>!</p><blockquote>Quoted wisdom</blockquote>"
+                    .to_string(),
+            ),
             url: "https://example.com/rust".to_string(),
             published: Some(Utc::now()),
             read: false,
@@ -70,8 +87,8 @@ mod tests {
 
     #[test]
     fn test_database_operations_and_filters() {
-        use ratarss::storage::Database;
         use ratarss::model::{CurrentFilter, SmartFeedKind};
+        use ratarss::storage::Database;
 
         let db = Database::in_memory().expect("in memory db failed");
         let feeds = db.get_all_feeds().expect("get feeds failed");
@@ -80,16 +97,24 @@ mod tests {
         let counts = db.get_unread_counts().expect("counts failed");
         assert!(counts.all_articles > 0);
 
-        let today_articles = db.get_articles_by_filter(&CurrentFilter::Smart(SmartFeedKind::Today)).expect("today failed");
+        let today_articles = db
+            .get_articles_by_filter(&CurrentFilter::Smart(SmartFeedKind::Today))
+            .expect("today failed");
         assert!(!today_articles.is_empty());
 
         let first_id = &today_articles[0].id;
-        db.set_article_read(first_id, true).expect("mark read failed");
+        db.set_article_read(first_id, true)
+            .expect("mark read failed");
         let updated_counts = db.get_unread_counts().expect("updated counts failed");
-        assert_eq!(updated_counts.all_unread, counts.all_unread.saturating_sub(1));
+        assert_eq!(
+            updated_counts.all_unread,
+            counts.all_unread.saturating_sub(1)
+        );
 
         db.set_article_starred(first_id, true).expect("star failed");
-        let starred = db.get_articles_by_filter(&CurrentFilter::Smart(SmartFeedKind::Starred)).expect("starred query failed");
+        let starred = db
+            .get_articles_by_filter(&CurrentFilter::Smart(SmartFeedKind::Starred))
+            .expect("starred query failed");
         assert!(starred.iter().any(|a| a.id == *first_id));
     }
 
@@ -103,5 +128,108 @@ mod tests {
 
         let snippet = generate_snippet(raw, 20);
         assert!(snippet.chars().count() <= 22);
+    }
+
+    #[test]
+    fn test_configurable_keybindings_matching() {
+        let slash_key = KeyEvent {
+            code: KeyCode::Char('/'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(key_matches(&slash_key, "/"));
+        assert!(key_matches(&slash_key, "?, /"));
+
+        let ctrl_f = KeyEvent {
+            code: KeyCode::Char('f'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(key_matches(&ctrl_f, "ctrl+f"));
+        assert!(key_matches(&ctrl_f, "ctrl+f, ctrl+s"));
+
+        let shift_m = KeyEvent {
+            code: KeyCode::Char('M'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(key_matches(&shift_m, "M"));
+
+        let j_key = KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(key_matches(&j_key, "j, down"));
+
+        let down_key = KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(key_matches(&down_key, "j, down"));
+    }
+
+    #[test]
+    fn test_app_config_keybindings_defaults() {
+        let config = AppConfig::default();
+        assert_eq!(config.keybindings.toggle_config, "/");
+        assert!(config.keybindings.quit.contains("q"));
+        assert!(config.keybindings.search.contains("ctrl+f"));
+    }
+
+    #[tokio::test]
+    async fn test_mouse_events_handling() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratarss::model::ActivePane;
+
+        let rt = tokio::runtime::Handle::current();
+        let mut app = ratarss::App::new(rt).expect("app new failed");
+
+        // Click on Sidebar (column 5, row 3)
+        let click_sidebar = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(click_sidebar, 100, 30);
+        assert_eq!(app.active_pane, ActivePane::Sidebar);
+
+        // Click on Article List (column 35, row 5)
+        let click_articles = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 35,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(click_articles, 100, 30);
+        assert_eq!(app.active_pane, ActivePane::ArticleList);
+
+        // Click on Reader View (column 80, row 10)
+        let click_reader = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 80,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(click_reader, 100, 30);
+        assert_eq!(app.active_pane, ActivePane::Reader);
+
+        // Scroll in reader
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 80,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        let prev_offset = app.reader_scroll_offset;
+        app.handle_mouse_event(scroll_down, 100, 30);
+        assert!(app.reader_scroll_offset >= prev_offset);
     }
 }

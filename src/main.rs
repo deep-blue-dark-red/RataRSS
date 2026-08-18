@@ -19,11 +19,14 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::stdout;
 use std::path::PathBuf;
-
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(name = "ratarss", version = "0.1.0", about = "A beautiful, minimal, themable, and customizable RSS reader in Ratatui in Rust resembling NetNewsWire")]
+#[command(
+    name = "ratarss",
+    version = "0.1.0",
+    about = "A fast, beautiful, and customizable TUI RSS reader in Rust"
+)]
 struct Cli {
     /// Import subscriptions from an OPML file
     #[arg(short, long, value_name = "FILE")]
@@ -41,7 +44,7 @@ struct Cli {
     #[arg(short, long, value_name = "FOLDER")]
     folder: Option<String>,
 
-    /// Theme to use (e.g. "NetNewsWire Dark", "Catppuccin Mocha", "Tokyo Night", "Nord", "Gruvbox Dark", "Dracula", "Minimal Monochrome")
+    /// Theme to use (e.g. "RataRSS Dark", "Catppuccin Mocha", "Tokyo Night", "Nord", "Gruvbox Dark", "Dracula", "Solarized Dark", "Rosé Pine")
     #[arg(short, long, value_name = "THEME")]
     theme: Option<String>,
 }
@@ -115,12 +118,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.config.theme = theme_name;
     }
 
-    // Main event loop
-    let tick_rate = Duration::from_millis(50);
+    // Main event loop (performance optimized to minimize CPU cycles)
     let mut last_tick = Instant::now();
+    let mut needs_redraw = true;
 
     while !app.should_quit {
-        terminal.draw(|f| ui::render_app(&app, f))?;
+        if needs_redraw {
+            terminal.draw(|f| ui::render_app(&app, f))?;
+            needs_redraw = false;
+        }
+
+        // Dynamic tick rate: 100ms when animations, toasts, or syncing active; 250ms when idle
+        let tick_rate = if app.is_syncing || app.modal_is_loading || app.toast_time.is_some() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(250)
+        };
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -129,20 +142,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Only process Press events (avoid double triggers on Windows/macOS)
                     if key.kind == crossterm::event::KeyEventKind::Press {
                         app.handle_key_event(key);
+                        needs_redraw = true;
                     }
                 }
                 Event::Mouse(mouse) => {
-                    app.handle_mouse_event(mouse);
+                    let size = terminal.size().unwrap_or_default();
+                    app.handle_mouse_event(mouse, size.width, size.height);
+                    needs_redraw = true;
                 }
                 Event::Resize(_, _) => {
-                    // Terminal resized, redrawn on next loop
+                    needs_redraw = true;
                 }
                 _ => {}
             }
         }
 
         if last_tick.elapsed() >= tick_rate {
-            app.on_tick();
+            let updated = app.on_tick();
+            if updated {
+                needs_redraw = true;
+            }
             last_tick = Instant::now();
         }
     }

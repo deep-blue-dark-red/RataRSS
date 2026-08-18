@@ -1,6 +1,6 @@
 # 📰 RataRSS
 
-> A beautiful, minimal, themable, and customizable terminal RSS reader built with [Ratatui](https://ratatui.rs) in Rust, faithfully replicating the clean three-pane design of **NetNewsWire**.
+> A fast, beautiful, themable, and customizable terminal RSS reader built with [Ratatui](https://ratatui.rs) in Rust.
 
 ![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)
 ![Ratatui](https://img.shields.io/badge/Ratatui-0.29-blue.svg)
@@ -10,39 +10,29 @@
 
 ## ✨ Features
 
-- 🖥️ **NetNewsWire 3-Pane Layout**:
+- 🖥️ **Modern 3-Pane TUI Layout**:
   1. **Sidebar**: Smart Feeds (☀️ *Today*, 🔵 *All Unread*, ⭐ *Starred*, 📜 *All Articles*) + Collapsible Folders with unread count badges.
   2. **Article List**: Multi-line article cards displaying unread indicators (`●`), star markers (`★`), bold titles, summary previews, source tags, and relative timestamps (`1:20 PM`, `Yesterday`).
-  3. **Reader View**: Clean typography, rich HTML/Markdown formatting (headings, blockquotes, code blocks, bullet points, links), and a dynamic reading progress indicator.
-- 📐 **Interactive Resizable Panes**:
-  - `<` / `>`: Adjust Sidebar width
-  - `[` / `]`: Adjust Article List width
-  - `+` / `-`: Adjust Reader View width
-  - `=` / `Ctrl+R`: Reset to default layout proportions
-  - `f` / `z`: Toggle Zen / Fullscreen mode on any pane
+  3. **Reader View**: Clean typography, rich HTML/Markdown formatting (headings, blockquotes, code blocks, bullet points, links), and a clean line position indicator (`Line 1/18`).
+- ⚙️ **Interactive Configuration Menu (`/`)**:
+  - Press `/` anywhere to toggle an interactive bottom popup menu.
+  - Configure themes, auto-refresh on startup, refresh intervals, mark-read behavior, text wrapping, and pane layout proportions live with instant persistence.
+  - Full support for **user-configurable keybindings** saved in `~/.config/ratarss/config.toml`.
+- 🎨 **27 Built-in Themes & Full Palette Customization**:
+  - Includes **RataRSS Dark** *(Default)*, **RataRSS Light**, **Catppuccin Mocha**, **Catppuccin Macchiato**, **Catppuccin Frappé**, **Catppuccin Latte**, **Tokyo Night**, **Tokyo Night Storm**, **Gruvbox Dark**, **Gruvbox Light**, **Nord**, **Dracula**, **Solarized Dark**, **Solarized Light**, **Rosé Pine**, **Rosé Pine Dawn**, **Rosé Pine Moon**, **Monokai Pro**, **One Dark**, **GitHub Dark**, **GitHub Light**, **Kanagawa**, **Everforest Dark**, **Everforest Light**, **Cyberpunk Neon**, **Horizon**, and **Minimal Monochrome**.
+  - Interactive theme picker (`T` or `t`) with live search, smooth scrolling, and dynamic window sizing.
+- ⚡ **Optimized Performance & Battery Friendly**:
+  - Reactive event loop that sleeps when idle, eliminating wasteful CPU cycles while maintaining snappy 100ms response during live animations and syncing.
 - 📥 **Standard OPML Import & Export**:
   - Full support for standard OPML 1.0 & 2.0 files with nested folders and metadata.
   - Interactive import/export modals in-app (`a` for add/import, `e` for export).
   - Headless CLI flags: `ratarss --import feeds.opml` and `ratarss --export backup.opml`.
-- 🎨 **Themable & Highly Customizable**:
-  - Built-in theme presets:
-    - **NetNewsWire Dark** *(Default, matching macOS NetNewsWire dark aesthetic)*
-    - **NetNewsWire Light**
-    - **Catppuccin Mocha**
-    - **Tokyo Night**
-    - **Gruvbox Dark**
-    - **Nord**
-    - **Dracula**
-    - **Minimal Monochrome**
-  - Switch themes live with instant preview (`T` or `t`).
-  - Persistent user configuration in `~/.config/ratarss/config.toml`.
-- ⚡ **Fast Asynchronous Sync & Local SQLite Caching**:
-  - Non-blocking background feed fetching with animated spinner (`⠋`).
-  - Supports RSS 0.9x, RSS 2.0, Atom 1.0, and JSON Feed via `feed-rs`.
+- 🔄 **Robust Multi-Feed Background Sync & Local SQLite Caching**:
+  - Concurrent non-blocking background feed fetching with connection timeouts and auto-completion.
   - Automatic feed discovery from website URLs.
   - SQLite database persists all articles, read/unread states, stars, and folder tree.
 - 🔍 **Realtime Search & Filter**:
-  - Press `/` to search and filter article titles, snippets, authors, and sources in real time.
+  - Press `Ctrl+F` (or customize in keybindings) to filter article titles, snippets, authors, and sources in real time.
 - 🌐 **Browser & Clipboard Integration**:
   - Press `o` or `Enter` in the reader to open the original article in your default browser.
   - Press `y` to copy article link to your clipboard.
@@ -77,12 +67,14 @@ ratarss --export my_feeds_backup.opml
 ratarss --add "https://news.ycombinator.com/rss" --folder "Tech"
 
 # Launch with a specific theme
-ratarss --theme "Tokyo Night"
+ratarss --theme "Catppuccin Mocha"
 ```
 
 ---
 
-## ⌨️ Keyboard Cheatsheet
+## ⌨️ Default Keyboard Reference
+
+*(All keybindings can be customized in `~/.config/ratarss/config.toml` or viewed via the `/` config menu)*
 
 | Category | Keybinding | Action |
 | :--- | :--- | :--- |
@@ -97,45 +89,20 @@ ratarss --theme "Tokyo Night"
 | | `s` | Toggle Star / Bookmark |
 | | `o` / `Enter` | Open article in default web browser |
 | | `y` | Copy article URL to clipboard |
-| | `/` | Real-time search & filter articles |
+| | `Ctrl+F` / `Ctrl+S` | Real-time search & filter articles |
+| **Configuration** | `/` | Toggle interactive Configuration Menu popup |
+| | `T` or `t` | Open interactive Theme Picker (27 themes) |
 | **Pane Resizing** | `<` / `>` | Decrease / Increase Sidebar width |
 | | `[` / `]` | Decrease / Increase Article List width |
 | | `+` / `-` | Decrease / Increase Reader width |
 | | `=` | Reset layout to default percentages |
 | | `f` or `z` | Toggle Fullscreen / Zen mode for active pane |
-| **Management** | `a` | Add feed URL or Import OPML modal |
+| **Feed Management** | `a` | Add feed URL or Import OPML modal |
 | | `e` | Export subscriptions to OPML modal |
 | | `r` / `R` | Refresh current feed / Refresh all feeds |
 | | `d` | Delete selected feed or folder |
-| | `T` or `t` | Open interactive Theme Picker |
 | | `?` or `F1` | Open Help modal |
 | | `q` / `Ctrl+C` | Quit application |
-
----
-
-## 📁 Project Architecture
-
-```
-src/
-├── main.rs          # CLI argument parsing, terminal lifecycle, event loop
-├── lib.rs           # Library exports
-├── app.rs           # State machine, key/mouse event dispatching, background sync
-├── model.rs         # Feed, Article, SidebarItem, SmartFeedKind, Filter models
-├── storage.rs       # SQLite persistence, schema migrations, unread counters
-├── fetcher.rs       # Async feed fetcher (RSS/Atom/JSON), auto-discovery, HTML cleaner
-├── opml.rs          # OPML 1.0 & 2.0 XML parser and generator
-├── reader.rs        # HTML/Markdown parser to styled Ratatui Text with word-wrap
-├── theme.rs         # Theme palette engine with 8 preset styles (NetNewsWire, Tokyo Night, etc.)
-├── config.rs        # Configuration loading and saving (~/.config/ratarss/config.toml)
-├── sample_data.rs   # Curated starter feeds matching NetNewsWire layout
-└── ui/
-    ├── mod.rs         # 3-Pane split coordinator, status bar, and modal manager
-    ├── sidebar.rs     # Left pane: Smart feeds, collapsible folder tree, unread badges
-    ├── article_list.rs# Middle pane: NetNewsWire card format, snippets, timestamps, search
-    ├── reader_view.rs # Right pane: Article header, typography, reader scroll, progress bar
-    ├── modals.rs      # Popups: Add Feed, OPML Import/Export, Theme Picker, Help, Delete
-    └── widgets.rs     # Custom widgets: Badges, progress bars, spinner animations
-```
 
 ---
 

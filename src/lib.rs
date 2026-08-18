@@ -8,3 +8,5 @@ pub mod sample_data;
 pub mod storage;
 pub mod theme;
 pub mod ui;
+
+pub use app::App;
