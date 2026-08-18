@@ -16,8 +16,8 @@ use tokio::runtime::Handle;
 pub enum AppEvent {
     FeedRefreshFinished {
         feed_id: String,
-        feed: Option<Feed>,
-        articles: Vec<Article>,
+        success: bool,
+        new_articles_count: usize,
         error: Option<String>,
     },
     AddFeedFinished {
@@ -312,8 +312,8 @@ impl App {
             match event {
                 AppEvent::FeedRefreshFinished {
                     feed_id: _,
-                    feed,
-                    articles,
+                    success,
+                    new_articles_count: _,
                     error,
                 } => {
                     self.pending_fetches = self.pending_fetches.saturating_sub(1);
@@ -322,11 +322,7 @@ impl App {
                         self.sync_start_time = None;
                     }
 
-                    if let Some(f) = feed {
-                        let _ = self.db.add_or_update_feed(&f);
-                    }
-                    if !articles.is_empty() {
-                        let _ = self.db.insert_articles(&articles);
+                    if success {
                         had_updates = true;
                     }
                     if let Some(err) = error {
@@ -1548,23 +1544,29 @@ impl App {
 
             let fetcher = self.fetcher.clone();
             let tx = self.event_sender.clone();
+            let db = self.db.clone();
 
             self.tokio_handle.spawn(async move {
                 let res = fetcher.fetch_feed(&feed).await;
                 match res {
                     Ok((updated_feed, articles)) => {
+                        let count = articles.len();
+                        let _ = db.add_or_update_feed(&updated_feed);
+                        if !articles.is_empty() {
+                            let _ = db.insert_articles(&articles);
+                        }
                         let _ = tx.send(AppEvent::FeedRefreshFinished {
                             feed_id: feed.id,
-                            feed: Some(updated_feed),
-                            articles,
+                            success: true,
+                            new_articles_count: count,
                             error: None,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::FeedRefreshFinished {
                             feed_id: feed.id,
-                            feed: None,
-                            articles: Vec::new(),
+                            success: false,
+                            new_articles_count: 0,
                             error: Some(e),
                         });
                     }
@@ -1589,26 +1591,37 @@ impl App {
         let feeds = self.feeds.clone();
         let fetcher = self.fetcher.clone();
         let tx = self.event_sender.clone();
+        let db = self.db.clone();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10)); // max 10 concurrent fetches
 
         for feed in feeds {
             let fetcher = fetcher.clone();
             let tx = tx.clone();
+            let db = db.clone();
+            let sem = semaphore.clone();
+
             self.tokio_handle.spawn(async move {
+                let _permit = sem.acquire().await;
                 let res = fetcher.fetch_feed(&feed).await;
                 match res {
                     Ok((updated_feed, articles)) => {
+                        let count = articles.len();
+                        let _ = db.add_or_update_feed(&updated_feed);
+                        if !articles.is_empty() {
+                            let _ = db.insert_articles(&articles);
+                        }
                         let _ = tx.send(AppEvent::FeedRefreshFinished {
                             feed_id: feed.id,
-                            feed: Some(updated_feed),
-                            articles,
+                            success: true,
+                            new_articles_count: count,
                             error: None,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::FeedRefreshFinished {
                             feed_id: feed.id,
-                            feed: None,
-                            articles: Vec::new(),
+                            success: false,
+                            new_articles_count: 0,
                             error: Some(e),
                         });
                     }

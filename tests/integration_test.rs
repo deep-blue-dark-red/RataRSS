@@ -232,4 +232,92 @@ mod tests {
         app.handle_mouse_event(scroll_down, 100, 30);
         assert!(app.reader_scroll_offset >= prev_offset);
     }
+
+    #[test]
+    fn test_zstd_compression_and_decompression() {
+        use ratarss::storage::{compress_text, decompress_text, Database};
+        use ratarss::model::CurrentFilter;
+
+        let sample_html = "<article><h1>Very Large Article Content</h1><p>".repeat(50);
+        let compressed = compress_text(&sample_html);
+        assert!(compressed.starts_with(b"ZSTD"));
+        assert!(compressed.len() < sample_html.len(), "Zstd should significantly reduce text size");
+
+        let decompressed = decompress_text(&compressed).expect("decompress failed");
+        assert_eq!(decompressed, sample_html);
+
+        // Verify storage roundtrip with zstd in SQLite
+        let db = Database::in_memory().expect("db in memory");
+        let stats = db.get_db_stats().expect("stats failed");
+        assert_eq!(stats.compression, "Zstandard (zstd level 3)");
+        assert!(stats.wal_mode);
+
+        let filter = CurrentFilter::Smart(ratarss::model::SmartFeedKind::AllArticles);
+        let articles = db.get_articles_by_filter(&filter).expect("get articles failed");
+        assert!(!articles.is_empty());
+        assert!(articles[0].content.is_some());
+    }
+
+    /// A database written before compression holds `summary`/`content` as TEXT.
+    /// Every smart feed must still list those articles: the sidebar counts them
+    /// with a SQL aggregate that never looks at the column's type, so if the
+    /// list query cannot read them the two disagree and the pane goes blank
+    /// while the count says thousands.
+    #[test]
+    fn test_legacy_uncompressed_text_rows_still_list() {
+        use ratarss::model::{CurrentFilter, SmartFeedKind};
+        use ratarss::storage::Database;
+        use rusqlite::{params, Connection};
+
+        let db = Database::in_memory().expect("db in memory");
+
+        let conn = Connection::open(db.get_path()).expect("open");
+        conn.execute(
+            "INSERT INTO articles (id, feed_id, feed_title, title, author, summary, content,
+                                   url, published, read, starred, created_at)
+             VALUES ('legacy-1', 'bloomberg-markets', 'Legacy Feed', 'Written before zstd', NULL,
+                     ?1, ?2, 'https://example.com/legacy', ?3, 0, 0, ?3)",
+            // Dated now, so the `Today` assertion below is about the column
+            // type rather than about the date falling outside the window.
+            params![
+                "a plain TEXT summary",
+                "a plain TEXT body",
+                Utc::now().timestamp()
+            ],
+        )
+        .expect("insert legacy row");
+
+        assert_eq!(
+            "text",
+            conn.query_row(
+                "SELECT typeof(summary) FROM articles WHERE id = 'legacy-1'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .expect("typeof"),
+            "the fixture must actually be TEXT or it proves nothing"
+        );
+        drop(conn);
+
+        for kind in [
+            SmartFeedKind::AllArticles,
+            SmartFeedKind::AllUnread,
+            SmartFeedKind::Today,
+        ] {
+            let listed = db
+                .get_articles_by_filter(&CurrentFilter::Smart(kind))
+                .unwrap_or_else(|e| panic!("{kind:?} failed to list at all: {e}"));
+            assert!(
+                listed.iter().any(|a| a.id == "legacy-1"),
+                "{kind:?} dropped the legacy row"
+            );
+        }
+
+        let listed = db
+            .get_articles_by_filter(&CurrentFilter::Smart(SmartFeedKind::AllArticles))
+            .expect("all articles");
+        let legacy = listed.iter().find(|a| a.id == "legacy-1").unwrap();
+        assert_eq!(legacy.summary.as_deref(), Some("a plain TEXT summary"));
+        assert_eq!(legacy.content.as_deref(), Some("a plain TEXT body"));
+    }
 }

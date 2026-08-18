@@ -49,10 +49,16 @@ struct Cli {
     theme: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let runtime_handle = tokio::runtime::Handle::current();
+
+    // Create background multi-threaded Tokio runtime for async tasks (fetching feeds, background sync)
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .thread_name("ratarss-async-worker")
+        .build()?;
+    let runtime_handle = runtime.handle().clone();
 
     // Headless CLI operations
     if let Some(ref import_path) = cli.import {
@@ -81,11 +87,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref feed_url) = cli.add {
         println!("➕ Adding feed: {}", feed_url);
-        let fetcher = fetcher::FeedFetcher::new();
-        let (feed, articles) = fetcher
-            .discover_or_create_feed(feed_url, cli.folder.clone())
-            .await
+        let folder = cli.folder.clone();
+        let (feed, articles) = runtime
+            .block_on(async {
+                let fetcher = fetcher::FeedFetcher::new();
+                fetcher.discover_or_create_feed(feed_url, folder).await
+            })
             .map_err(|e| format!("Failed to add feed: {}", e))?;
+
         let db = storage::Database::new()?;
         let title = feed.title.clone();
         db.add_or_update_feed(&feed)?;
