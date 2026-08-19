@@ -20,7 +20,7 @@ any terminal, and never makes you wait.
 
 ---
 
-## Its Fast
+## It's Fast
 
 Every number below was measured on a real library: **13,098 articles across 474
 feeds**, a 21 MB database, on an ordinary laptop.
