@@ -487,7 +487,12 @@ impl<'a> ConfigMenuModal<'a> {
         let page_keys = format!("{}, {}", self.config.keybindings.page_down, self.config.keybindings.page_up);
         let jump_keys = format!("{}, {}", self.config.keybindings.jump_top, self.config.keybindings.jump_bottom);
 
-        let bindings: [(&str, &str, &str); 26] = [
+        let article_step_keys = format!(
+            "{}, {}",
+            self.config.keybindings.next_article, self.config.keybindings.prev_article
+        );
+
+        let bindings: [(&str, &str, &str); 27] = [
             ("Toggle Config Menu", self.config.keybindings.toggle_config.as_str(), "Open / close this popup"),
             ("Quit Application", self.config.keybindings.quit.as_str(), "Exit RataRSS"),
             ("Help / Cheatsheet", self.config.keybindings.help.as_str(), "Open help modal"),
@@ -509,6 +514,7 @@ impl<'a> ConfigMenuModal<'a> {
             ("Previous Pane", self.config.keybindings.focus_prev_pane.as_str(), "Move focus left"),
             ("Jump to Feeds / Articles / Reader", "1, 2, 3", "Direct pane focus"),
             ("Navigate Down / Up", nav_keys.as_str(), "Scroll / select items"),
+            ("Next / Previous Article", article_step_keys.as_str(), "Change article from any pane"),
             ("Page Down / Up", page_keys.as_str(), "Page scroll"),
             ("Space Scroll / Advance", self.config.keybindings.space_advance.as_str(), "Scroll reader / advance"),
             ("Jump Top / Bottom", jump_keys.as_str(), "Jump to extremes"),
@@ -597,7 +603,8 @@ impl<'a> Widget for HelpModal<'a> {
                 ("Tab / Shift+Tab", "Cycle focus between Sidebar, Article List, and Reader"),
                 ("h / l or Left / Right", "Move focus left / right across panes"),
                 ("1 / 2 / 3", "Direct jump to Sidebar (1), Articles (2), Reader (3)"),
-                ("j / k or Down / Up", "Navigate items in list or scroll reader"),
+                ("j / k or Down / Up", "Navigate items in list or scroll reader (zen: change article)"),
+                ("J / K", "Next / previous article, from any pane"),
                 ("Space", "Page down reader article / advance to next unread"),
                 ("g / G", "Jump to top / bottom of active pane"),
             ]),

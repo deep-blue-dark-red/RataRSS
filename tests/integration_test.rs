@@ -762,6 +762,94 @@ wrap_article_text = true
         assert!(!app.handle_key_event(press(KeyCode::Char('z'))));
     }
 
+    /// In the split view `j` scrolls the reader a line at a time. In zen mode
+    /// the article list is off-screen, so `j`/`k` step between articles
+    /// instead — otherwise there is no way to leave the article you are on.
+    /// `J`/`K` do the same from any pane, in either mode.
+    #[tokio::test]
+    async fn reader_navigation_differs_between_split_and_zen() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        use ratarss::model::ActivePane;
+
+        fn press(c: char) -> KeyEvent {
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: if c.is_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                },
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            }
+        }
+
+        let rt = tokio::runtime::Handle::current();
+        let mut app = ratarss::App::new(rt).expect("app new failed");
+        app.active_pane = ActivePane::Reader;
+
+        // Split view: `j` is a line scroll.
+        app.handle_key_event(press('j'));
+        assert_eq!(app.reader_scroll_offset, 2, "split-view j should scroll");
+
+        // Zen mode: `j` moves through articles and leaves the scroll alone.
+        app.reader_scroll_offset = 0;
+        app.is_zen_mode = true;
+        app.handle_key_event(press('j'));
+        assert_eq!(app.reader_scroll_offset, 0, "zen j should not scroll");
+
+        // Whatever the database holds, stepping past either end is a no-op and
+        // reports no redraw; with more than one article the pair round-trips.
+        let selected = app.article_selected_idx;
+        if app.visible_len() > 1 {
+            assert!(app.handle_key_event(press('J')));
+            assert_eq!(app.article_selected_idx, selected + 1);
+            assert!(app.handle_key_event(press('K')));
+            assert_eq!(app.article_selected_idx, selected);
+        }
+        app.article_selected_idx = 0;
+        assert!(!app.handle_key_event(press('K')), "no article before the first");
+    }
+
+    /// Scrolling used to run off the end of the document — `G` alone added a
+    /// hundred rows — leaving a blank pane that took just as many presses to
+    /// scroll back out of. The end of the article is now the end of the scroll.
+    #[tokio::test]
+    async fn reader_scroll_stops_at_the_end_of_the_article() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        use ratarss::model::ActivePane;
+        use ratatui::layout::Rect;
+
+        let rt = tokio::runtime::Handle::current();
+        let mut app = ratarss::App::new(rt).expect("app new failed");
+        app.active_pane = ActivePane::Reader;
+
+        let Some(_) = app.selected_article() else {
+            return; // Nothing to read in this database; nothing to assert.
+        };
+
+        // Stand in for a render: lay the article out and record where it drew.
+        const WIDTH: u16 = 80;
+        const ROWS: u16 = 10;
+        app.set_reader_text_area(Rect::new(0, 0, WIDTH, ROWS));
+        let total = app.with_formatted_article(WIDTH, |f| f.map_or(0, |f| f.total_lines));
+        assert!(total > 0, "a selected article should format to something");
+
+        let end = total.saturating_sub(ROWS as usize);
+        let jump_bottom = KeyEvent {
+            code: KeyCode::Char('G'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_key_event(jump_bottom);
+        assert_eq!(app.reader_scroll_offset, end, "G should land on the last page");
+        assert!(
+            !app.handle_key_event(jump_bottom),
+            "already at the end: no move, no redraw"
+        );
+    }
+
     /// The matcher runs over bytes when everything is ASCII and over chars
     /// otherwise; both paths have to fold case and find word starts the same
     /// way.

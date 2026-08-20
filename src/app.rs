@@ -52,7 +52,7 @@ pub enum AppEvent {
 }
 
 /// Rows listed in the keybindings sub-view.
-const KEYBIND_ROWS: usize = 26;
+const KEYBIND_ROWS: usize = 27;
 
 /// Number of rows in the main configuration menu.
 const CONFIG_MENU_ITEMS: usize = 11;
@@ -161,6 +161,12 @@ pub struct App {
 
     pub should_quit: bool,
 
+    /// When the feeds were last pulled, manually or on the timer.
+    ///
+    /// `refresh_interval_minutes` has always been in the settings menu but
+    /// nothing ever acted on it; this is what makes it mean something.
+    last_refresh: Instant,
+
     /// Settings changed since the last write to disk.
     ///
     /// Holding `→` on the refresh-interval row used to serialize and rewrite
@@ -249,6 +255,7 @@ impl App {
             event_receiver,
 
             should_quit: false,
+            last_refresh: Instant::now(),
             config_dirty: false,
         };
 
@@ -653,6 +660,16 @@ impl App {
                         had_updates = true;
                     }
                 }
+            }
+        }
+
+        // Scheduled background sync. Skipped while a sync is already running,
+        // so a slow round never stacks up behind itself.
+        if !self.is_syncing && !self.feeds.is_empty() {
+            let interval =
+                std::time::Duration::from_secs(self.config.refresh_interval_minutes.max(1) * 60);
+            if self.last_refresh.elapsed() >= interval {
+                self.refresh_all_feeds();
             }
         }
 
@@ -1082,6 +1099,12 @@ impl App {
         }
 
         // Navigation inside pane
+        if kb.matches(&key, &kb.next_article) {
+            return self.select_relative_article(1);
+        }
+        if kb.matches(&key, &kb.prev_article) {
+            return self.select_relative_article(-1);
+        }
         if kb.matches(&key, &kb.nav_down) {
             return self.navigate_down();
         }
@@ -1089,24 +1112,19 @@ impl App {
             return self.navigate_up();
         }
         if kb.matches(&key, &kb.page_down) {
-            self.page_down();
-            return true;
+            return self.page_down();
         }
         if kb.matches(&key, &kb.page_up) {
-            self.page_up();
-            return true;
+            return self.page_up();
         }
         if kb.matches(&key, &kb.space_advance) {
-            self.space_advance();
-            return true;
+            return self.space_advance();
         }
         if kb.matches(&key, &kb.jump_top) {
-            self.jump_to_top();
-            return true;
+            return self.jump_to_top();
         }
         if kb.matches(&key, &kb.jump_bottom) {
-            self.jump_to_bottom();
-            return true;
+            return self.jump_to_bottom();
         }
         if kb.matches(&key, &kb.select_enter) {
             self.handle_enter_key();
@@ -1398,13 +1416,50 @@ impl App {
         }
     }
 
+    /// Largest useful reader scroll offset: where the last line of the article
+    /// sits on the bottom row of the pane.
+    ///
+    /// `None` when the answer is not known yet — nothing has laid this article
+    /// out at this width — in which case scrolling is left unclamped rather
+    /// than bounded by a stale document.
+    fn max_reader_scroll(&self) -> Option<usize> {
+        let article_id = &self.selected_article()?.id;
+        let cache = self.reader_cache.borrow();
+        let cached = cache.as_ref()?;
+        if cached.article_id != *article_id {
+            return None;
+        }
+        // The text area recorded during render is exactly the rows of article
+        // text the reader draws.
+        let rows = self.reader_text_area.get().height as usize;
+        Some(cached.formatted.total_lines.saturating_sub(rows))
+    }
+
     /// Scroll the reader by `amount` rows, reporting whether it moved.
+    ///
+    /// Stops at the end of the article. Without the clamp the offset ran away
+    /// past the last line — `G` alone added a hundred rows — and every one of
+    /// those rows had to be scrolled back through to see the text again.
     fn scroll_reader(&mut self, down: bool, amount: usize) -> bool {
         let before = self.reader_scroll_offset;
-        self.reader_scroll_offset = if down {
+        let mut next = if down {
             before.saturating_add(amount)
         } else {
             before.saturating_sub(amount)
+        };
+        if let Some(max) = self.max_reader_scroll() {
+            next = next.min(max);
+        }
+        self.reader_scroll_offset = next;
+        next != before
+    }
+
+    /// Jump to the end of the article, as far as the layout is known.
+    fn scroll_reader_to_end(&mut self) -> bool {
+        let before = self.reader_scroll_offset;
+        self.reader_scroll_offset = match self.max_reader_scroll() {
+            Some(max) => max,
+            None => before.saturating_add(100),
         };
         self.reader_scroll_offset != before
     }
@@ -1699,10 +1754,41 @@ impl App {
         }
 
         if row < 12 {
-            self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(4);
+            self.scroll_reader(false, 4);
         } else {
-            self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(4);
+            self.scroll_reader(true, 4);
         }
+    }
+
+    /// Select the article `delta` places from the current one, reporting
+    /// whether the selection moved.
+    ///
+    /// Works from any pane, so an article can be changed without leaving the
+    /// reader — the only way to do it in zen mode, where the list is hidden.
+    fn select_relative_article(&mut self, delta: isize) -> bool {
+        let visible = self.visible_len();
+        if visible == 0 {
+            return false;
+        }
+
+        let target = if delta >= 0 {
+            self.article_selected_idx.saturating_add(delta as usize)
+        } else {
+            match self.article_selected_idx.checked_sub(delta.unsigned_abs()) {
+                Some(t) => t,
+                None => return false,
+            }
+        };
+        if target >= visible || target == self.article_selected_idx {
+            return false;
+        }
+
+        self.article_selected_idx = target;
+        self.reader_scroll_offset = 0;
+        if self.config.mark_read_on_open {
+            self.mark_current_article_read();
+        }
+        true
     }
 
     /// Move one step down the focused pane, reporting whether it moved.
@@ -1735,7 +1821,16 @@ impl App {
                     false
                 }
             }
-            ActivePane::Reader => self.scroll_reader(true, 2),
+            // Zen mode hides the article list, so j/k are the only way to
+            // move between articles there; the reader still pages with space
+            // and PageDown. Split view keeps j/k as a line scroll.
+            ActivePane::Reader => {
+                if self.is_zen_mode {
+                    self.select_relative_article(1)
+                } else {
+                    self.scroll_reader(true, 2)
+                }
+            }
         }
     }
 
@@ -1768,11 +1863,29 @@ impl App {
                     false
                 }
             }
-            ActivePane::Reader => self.scroll_reader(false, 2),
+            ActivePane::Reader => {
+                if self.is_zen_mode {
+                    self.select_relative_article(-1)
+                } else {
+                    self.scroll_reader(false, 2)
+                }
+            }
         }
     }
 
-    fn page_down(&mut self) {
+    /// Where the visible state of a jump-style move lives, so the four
+    /// functions below can report whether they actually changed anything
+    /// without each repeating the comparison.
+    fn jump_state(&self) -> (usize, usize, usize) {
+        (
+            self.sidebar_selected_idx,
+            self.article_selected_idx,
+            self.reader_scroll_offset,
+        )
+    }
+
+    fn page_down(&mut self) -> bool {
+        let before = self.jump_state();
         match self.active_pane {
             ActivePane::Sidebar => {
                 self.sidebar_selected_idx = (self.sidebar_selected_idx + 8).min(self.sidebar_items.len().saturating_sub(1));
@@ -1784,12 +1897,14 @@ impl App {
                 self.reader_scroll_offset = 0;
             }
             ActivePane::Reader => {
-                self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(15);
+                self.scroll_reader(true, 15);
             }
         }
+        self.jump_state() != before
     }
 
-    fn page_up(&mut self) {
+    fn page_up(&mut self) -> bool {
+        let before = self.jump_state();
         match self.active_pane {
             ActivePane::Sidebar => {
                 self.sidebar_selected_idx = self.sidebar_selected_idx.saturating_sub(8);
@@ -1800,16 +1915,18 @@ impl App {
                 self.reader_scroll_offset = 0;
             }
             ActivePane::Reader => {
-                self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(15);
+                self.scroll_reader(false, 15);
             }
         }
+        self.jump_state() != before
     }
 
-    fn space_advance(&mut self) {
-        self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(12);
+    fn space_advance(&mut self) -> bool {
+        self.scroll_reader(true, 12)
     }
 
-    fn jump_to_top(&mut self) {
+    fn jump_to_top(&mut self) -> bool {
+        let before = self.jump_state();
         match self.active_pane {
             ActivePane::Sidebar => {
                 self.sidebar_selected_idx = 1;
@@ -1823,9 +1940,11 @@ impl App {
                 self.reader_scroll_offset = 0;
             }
         }
+        self.jump_state() != before
     }
 
-    fn jump_to_bottom(&mut self) {
+    fn jump_to_bottom(&mut self) -> bool {
+        let before = self.jump_state();
         match self.active_pane {
             ActivePane::Sidebar => {
                 self.sidebar_selected_idx = self.sidebar_items.len().saturating_sub(1);
@@ -1836,9 +1955,10 @@ impl App {
                 self.reader_scroll_offset = 0;
             }
             ActivePane::Reader => {
-                self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(100);
+                self.scroll_reader_to_end();
             }
         }
+        self.jump_state() != before
     }
 
     fn handle_enter_key(&mut self) {
@@ -2023,6 +2143,7 @@ impl App {
         };
 
         if let Some(feed) = feed_to_refresh {
+            self.last_refresh = Instant::now();
             let feed_title = feed.title.clone();
             self.pending_fetches += 1;
             self.is_syncing = true;
@@ -2065,6 +2186,7 @@ impl App {
     }
 
     pub fn refresh_all_feeds(&mut self) {
+        self.last_refresh = Instant::now();
         if self.feeds.is_empty() {
             self.is_syncing = false;
             return;

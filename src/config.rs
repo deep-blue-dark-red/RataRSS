@@ -39,6 +39,10 @@ pub struct KeyBindingsConfig {
     pub focus_reader: String,
     pub nav_down: String,
     pub nav_up: String,
+    /// Next article, from any pane (default `J`).
+    pub next_article: String,
+    /// Previous article, from any pane (default `K`).
+    pub prev_article: String,
     pub page_down: String,
     pub page_up: String,
     pub space_advance: String,
@@ -81,6 +85,8 @@ impl Default for KeyBindingsConfig {
             focus_reader: "3".to_string(),
             nav_down: "j, down".to_string(),
             nav_up: "k, up".to_string(),
+            next_article: "J".to_string(),
+            prev_article: "K".to_string(),
             page_down: "pagedown".to_string(),
             page_up: "pageup".to_string(),
             space_advance: "space".to_string(),
