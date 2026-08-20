@@ -11,6 +11,12 @@ pub struct Feed {
     pub custom_icon: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// `ETag` from the last successful fetch, replayed as `If-None-Match` on
+    /// the next one so an unchanged feed can answer 304 with no body.
+    pub etag: Option<String>,
+    /// `Last-Modified` from the last successful fetch, replayed as
+    /// `If-Modified-Since`.
+    pub last_modified: Option<String>,
     pub unread_count: usize,
     pub total_count: usize,
 }
@@ -26,6 +32,8 @@ impl Feed {
             custom_icon: None,
             last_updated: None,
             error: None,
+            etag: None,
+            last_modified: None,
             unread_count: 0,
             total_count: 0,
         }

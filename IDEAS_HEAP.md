@@ -64,10 +64,14 @@ Each of these is either a feature to build or a line to delete.
 
 ## Sync
 
-- **Conditional GET (ETag / `If-Modified-Since`)** — `fetcher.rs` has none, so
-  every refresh pulls every feed in full. This is what makes a short refresh
-  interval polite rather than abusive, and it is the natural follow-up to the
-  scheduled sync above.
+- **Conditional GET (ETag / `If-Modified-Since`)** — **done.** The validators
+  from each successful fetch are stored on the feed and replayed on the next
+  request; a 304 comes back as `FetchOutcome::NotModified` and writes nothing,
+  parses nothing and triggers no reload. Feeds that send no validators simply
+  keep getting 200s. Not covered yet: recording a "last checked" time on the
+  304 path (deliberately left out to keep it free of writes), and the
+  discovery fallback drops validators because the URL it read is not the URL
+  the next fetch will ask for.
 - **Per-feed backoff** after repeated failures, instead of retrying a dead feed
   every cycle at full rate.
 - **"Last synced" indicator** in the status bar. The 15-second failsafe

@@ -68,6 +68,33 @@ fn read_body_column(row: &Row, idx: usize) -> Result<Option<String>> {
     }
 }
 
+/// Add a column to an existing table unless it is already there.
+///
+/// `CREATE TABLE IF NOT EXISTS` never revisits a table, so every column added
+/// after the original schema has to be applied by hand. Two instances of the
+/// app starting at the same moment can both find a column missing and both try
+/// to add it; the loser is told "duplicate column name", which only means the
+/// work it wanted done is done. The names are compile-time constants from the
+/// calls below, never user input.
+fn add_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+    let present = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .flatten()
+            .collect();
+        names.iter().any(|name| name == column)
+    };
+    if present {
+        return Ok(());
+    }
+
+    match conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty};")) {
+        Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+        other => other,
+    }
+}
+
 /// Longest plain-text preview kept per article for the list pane.
 const SNIPPET_CHARS: usize = 220;
 
@@ -214,7 +241,9 @@ impl Database {
                 folder TEXT,
                 custom_icon TEXT,
                 last_updated INTEGER,
-                error TEXT
+                error TEXT,
+                etag TEXT,
+                last_modified TEXT
             );
 
             CREATE TABLE IF NOT EXISTS articles (
@@ -263,17 +292,14 @@ impl Database {
         // list query touches no compressed blob at all — decompressing every
         // article's summary just to show one truncated line was the bulk of the
         // cost of opening a large view.
-        let existing: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(articles)")?;
-            let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
-            names.flatten().collect()
-        };
-        if !existing.iter().any(|c| c == "sort_ts") {
-            conn.execute_batch("ALTER TABLE articles ADD COLUMN sort_ts INTEGER;")?;
-        }
-        if !existing.iter().any(|c| c == "snippet") {
-            conn.execute_batch("ALTER TABLE articles ADD COLUMN snippet TEXT;")?;
-        }
+        add_column(&conn, "articles", "sort_ts", "INTEGER")?;
+        add_column(&conn, "articles", "snippet", "TEXT")?;
+
+        // The HTTP validators from a feed's last fetch. Sending them back turns
+        // an unchanged feed into a 304 with no body, which matters now that
+        // feeds are pulled on a timer rather than only when asked.
+        add_column(&conn, "feeds", "etag", "TEXT")?;
+        add_column(&conn, "feeds", "last_modified", "TEXT")?;
 
         conn.execute_batch(
             "
@@ -516,7 +542,8 @@ impl Database {
     pub fn get_all_feeds(&self) -> Result<Vec<Feed>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, title, url, site_url, folder, custom_icon, last_updated, error FROM feeds ORDER BY folder ASC, title ASC"
+            "SELECT id, title, url, site_url, folder, custom_icon, last_updated, error, etag, last_modified
+             FROM feeds ORDER BY folder ASC, title ASC"
         )?;
         
         let feed_rows = stmt.query_map([], |row| {
@@ -532,6 +559,8 @@ impl Database {
                 custom_icon: row.get(5)?,
                 last_updated,
                 error: row.get(7)?,
+                etag: row.get(8)?,
+                last_modified: row.get(9)?,
                 unread_count: 0,
                 total_count: 0,
             })
@@ -547,14 +576,16 @@ impl Database {
     pub fn add_or_update_feed(&self, feed: &Feed) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO feeds (id, title, url, site_url, folder, custom_icon, last_updated, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO feeds (id, title, url, site_url, folder, custom_icon, last_updated, error, etag, last_modified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 site_url = COALESCE(excluded.site_url, feeds.site_url),
                 folder = COALESCE(excluded.folder, feeds.folder),
                 last_updated = excluded.last_updated,
-                error = excluded.error",
+                error = excluded.error,
+                etag = excluded.etag,
+                last_modified = excluded.last_modified",
             params![
                 feed.id,
                 feed.title,
@@ -563,7 +594,9 @@ impl Database {
                 feed.folder,
                 feed.custom_icon,
                 feed.last_updated.map(|d| d.timestamp()),
-                feed.error
+                feed.error,
+                feed.etag,
+                feed.last_modified
             ],
         )?;
         Ok(())

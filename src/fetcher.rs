@@ -2,8 +2,28 @@ use crate::model::{Article, Feed};
 use crate::opml::generate_feed_id;
 use chrono::{DateTime, Utc};
 use regex::Regex;
-use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderValue, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use reqwest::{Client, StatusCode};
 use std::time::Duration;
+
+/// What came back from a feed request.
+///
+/// Feeds are pulled on a timer, so most requests are asking a question the
+/// server has already answered: "has anything changed?". Saying so explicitly
+/// keeps the unchanged case free of a parse, a database write and a reload.
+pub enum FetchOutcome {
+    Fetched {
+        feed: Feed,
+        articles: Vec<Article>,
+    },
+    /// The server answered 304: nothing to do.
+    NotModified,
+}
+
+/// A response header as an owned string, if it is present and printable.
+fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers.get(name)?.to_str().ok().map(str::to_owned)
+}
 
 #[derive(Clone)]
 pub struct FeedFetcher {
@@ -29,18 +49,40 @@ impl FeedFetcher {
         Self { client }
     }
 
-    pub async fn fetch_feed(&self, feed: &Feed) -> Result<(Feed, Vec<Article>), String> {
-        let response = self
-            .client
-            .get(&feed.url)
+    pub async fn fetch_feed(&self, feed: &Feed) -> Result<FetchOutcome, String> {
+        // Replay the validators from last time. A feed that has not changed
+        // answers 304 with an empty body, which costs a request header and
+        // nothing else.
+        let mut request = self.client.get(&feed.url);
+        if let Some(value) = feed.etag.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+            request = request.header(IF_NONE_MATCH, value);
+        }
+        if let Some(value) = feed
+            .last_modified
+            .as_deref()
+            .and_then(|v| HeaderValue::from_str(v).ok())
+        {
+            request = request.header(IF_MODIFIED_SINCE, value);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| format!("Network request failed: {}", e))?;
 
         let status = response.status();
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(FetchOutcome::NotModified);
+        }
         if !status.is_success() {
             return Err(format!("HTTP error {}: {}", status.as_u16(), status.canonical_reason().unwrap_or("")));
         }
+
+        // Read the validators before the body is consumed.
+        let mut validators = (
+            header_string(response.headers(), ETAG),
+            header_string(response.headers(), LAST_MODIFIED),
+        );
 
         let bytes = response
             .bytes()
@@ -60,6 +102,11 @@ impl FeedFetcher {
                             .send()
                             .await
                             .map_err(|e| format!("Discovered feed request failed: {}", e))?;
+                        // The validators above describe the page we were
+                        // pointed at, not the feed we ended up reading, and the
+                        // next fetch will ask for the original URL again — so
+                        // they are worse than useless here.
+                        validators = (None, None);
                         let disc_bytes = discovered_resp.bytes().await.map_err(|e| e.to_string())?;
                         feed_rs::parser::parse(&disc_bytes[..])
                             .map_err(|e| format!("Failed to parse discovered feed: {}", e))?
@@ -87,6 +134,7 @@ impl FeedFetcher {
 
         updated_feed.last_updated = Some(Utc::now());
         updated_feed.error = None;
+        (updated_feed.etag, updated_feed.last_modified) = validators;
 
         let mut articles = Vec::new();
         let now = Utc::now();
@@ -147,7 +195,10 @@ impl FeedFetcher {
             });
         }
 
-        Ok((updated_feed, articles))
+        Ok(FetchOutcome::Fetched {
+            feed: updated_feed,
+            articles,
+        })
     }
 
     pub async fn discover_or_create_feed(&self, url: &str, folder: Option<String>) -> Result<(Feed, Vec<Article>), String> {
@@ -159,7 +210,14 @@ impl FeedFetcher {
             folder,
         );
 
-        self.fetch_feed(&temp_feed).await
+        match self.fetch_feed(&temp_feed).await? {
+            FetchOutcome::Fetched { feed, articles } => Ok((feed, articles)),
+            // A feed we have never fetched carries no validators, so the server
+            // has nothing to compare against and cannot answer 304.
+            FetchOutcome::NotModified => {
+                Err("Server reported no changes for a feed that is new here".to_string())
+            }
+        }
     }
 }
 

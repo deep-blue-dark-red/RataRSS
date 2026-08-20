@@ -1,5 +1,5 @@
 use crate::config::{AppConfig, KeyBindingsConfig};
-use crate::fetcher::FeedFetcher;
+use crate::fetcher::{FeedFetcher, FetchOutcome};
 use crate::model::{ActivePane, Article, ArticleSlice, CurrentFilter, Feed, SidebarItem, SmartFeedKind};
 use crate::opml::{export_opml, parse_opml_file};
 use crate::storage::{Database, UnreadCounts};
@@ -35,6 +35,9 @@ pub enum AppEvent {
         feed_id: String,
         success: bool,
         new_articles_count: usize,
+        /// The server answered 304: nothing was written, so nothing needs
+        /// reloading.
+        unchanged: bool,
         error: Option<String>,
     },
     /// A feed added from the modal, already written to the database by the
@@ -63,6 +66,50 @@ const MAX_PADDING: u16 = 6;
 /// Largest gap between article cards, in *half* rows, offered by the settings
 /// menu (6 halves = 3 rows).
 const MAX_ARTICLE_SPACING: u16 = 6;
+
+/// Store a fetch result and tell the UI thread about it.
+///
+/// Runs on the worker that did the fetch, so a feed's database writes never
+/// land on the UI thread. A 304 writes nothing at all — that is the whole
+/// point of sending the validators.
+fn finish_fetch(
+    db: &Database,
+    tx: &Sender<AppEvent>,
+    feed_id: String,
+    result: Result<FetchOutcome, String>,
+) {
+    let event = match result {
+        Ok(FetchOutcome::Fetched { feed, articles }) => {
+            let count = articles.len();
+            let _ = db.add_or_update_feed(&feed);
+            if !articles.is_empty() {
+                let _ = db.insert_articles(&articles);
+            }
+            AppEvent::FeedRefreshFinished {
+                feed_id,
+                success: true,
+                new_articles_count: count,
+                unchanged: false,
+                error: None,
+            }
+        }
+        Ok(FetchOutcome::NotModified) => AppEvent::FeedRefreshFinished {
+            feed_id,
+            success: true,
+            new_articles_count: 0,
+            unchanged: true,
+            error: None,
+        },
+        Err(e) => AppEvent::FeedRefreshFinished {
+            feed_id,
+            success: false,
+            new_articles_count: 0,
+            unchanged: false,
+            error: Some(e),
+        },
+    };
+    let _ = tx.send(event);
+}
 
 /// Saturating add of a signed delta to an unread counter.
 fn adjust(counter: &mut usize, delta: isize) {
@@ -605,6 +652,7 @@ impl App {
                     feed_id: _,
                     success,
                     new_articles_count: _,
+                    unchanged,
                     error,
                 } => {
                     self.pending_fetches = self.pending_fetches.saturating_sub(1);
@@ -613,7 +661,10 @@ impl App {
                         self.sync_start_time = None;
                     }
 
-                    if success {
+                    // A 304 wrote nothing, so there is nothing to reload; on a
+                    // quiet cycle every feed answers this way and the sync
+                    // costs one request header each.
+                    if success && !unchanged {
                         had_updates = true;
                     }
                     if let Some(err) = error {
@@ -2154,30 +2205,8 @@ impl App {
             let db = self.db.clone();
 
             self.tokio_handle.spawn(async move {
-                let res = fetcher.fetch_feed(&feed).await;
-                match res {
-                    Ok((updated_feed, articles)) => {
-                        let count = articles.len();
-                        let _ = db.add_or_update_feed(&updated_feed);
-                        if !articles.is_empty() {
-                            let _ = db.insert_articles(&articles);
-                        }
-                        let _ = tx.send(AppEvent::FeedRefreshFinished {
-                            feed_id: feed.id,
-                            success: true,
-                            new_articles_count: count,
-                            error: None,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::FeedRefreshFinished {
-                            feed_id: feed.id,
-                            success: false,
-                            new_articles_count: 0,
-                            error: Some(e),
-                        });
-                    }
-                }
+                let result = fetcher.fetch_feed(&feed).await;
+                finish_fetch(&db, &tx, feed.id, result);
             });
             self.set_toast(format!("Refreshing {feed_title}..."));
         } else {
@@ -2210,30 +2239,8 @@ impl App {
 
             self.tokio_handle.spawn(async move {
                 let _permit = sem.acquire().await;
-                let res = fetcher.fetch_feed(&feed).await;
-                match res {
-                    Ok((updated_feed, articles)) => {
-                        let count = articles.len();
-                        let _ = db.add_or_update_feed(&updated_feed);
-                        if !articles.is_empty() {
-                            let _ = db.insert_articles(&articles);
-                        }
-                        let _ = tx.send(AppEvent::FeedRefreshFinished {
-                            feed_id: feed.id,
-                            success: true,
-                            new_articles_count: count,
-                            error: None,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::FeedRefreshFinished {
-                            feed_id: feed.id,
-                            success: false,
-                            new_articles_count: 0,
-                            error: Some(e),
-                        });
-                    }
-                }
+                let result = fetcher.fetch_feed(&feed).await;
+                finish_fetch(&db, &tx, feed.id, result);
             });
         }
 

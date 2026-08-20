@@ -850,6 +850,122 @@ wrap_article_text = true
         );
     }
 
+    /// The validators have to survive the round trip through SQLite, or every
+    /// fetch stays unconditional no matter what the server sent.
+    #[test]
+    fn feed_validators_round_trip_through_the_database() {
+        use ratarss::model::Feed;
+        use ratarss::storage::Database;
+
+        let db = Database::in_memory().expect("in memory db failed");
+        let mut feed = Feed::new(
+            "validator-feed".to_string(),
+            "Validators".to_string(),
+            "https://example.com/validators.xml".to_string(),
+            None,
+            None,
+        );
+        feed.etag = Some("\"abc\"".to_string());
+        feed.last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+        db.add_or_update_feed(&feed).expect("insert failed");
+
+        let stored = db
+            .get_all_feeds()
+            .expect("read failed")
+            .into_iter()
+            .find(|f| f.id == "validator-feed")
+            .expect("feed missing after insert");
+        assert_eq!(stored.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(
+            stored.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+    }
+
+    /// Feeds are pulled on a timer now, so most requests ask a question the
+    /// server has already answered. The first fetch records the `ETag`, the
+    /// second sends it back as `If-None-Match`, and a 304 comes home as
+    /// `NotModified` — not as an HTTP error, and with nothing to parse.
+    #[tokio::test]
+    async fn conditional_get_turns_an_unchanged_feed_into_a_304() {
+        use ratarss::fetcher::{FeedFetcher, FetchOutcome};
+        use ratarss::model::Feed;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        const RSS: &str = concat!(
+            r#"<?xml version="1.0"?><rss version="2.0"><channel>"#,
+            "<title>Test Feed</title><link>http://example.com</link>",
+            "<description>d</description>",
+            "<item><title>Hello</title><link>http://example.com/1</link>",
+            "<guid>1</guid></item></channel></rss>"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr = listener.local_addr().expect("no local addr");
+
+        // Answers exactly two requests and reports whether each one carried the
+        // validator.
+        let server = tokio::spawn(async move {
+            let mut conditional_requests = Vec::new();
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.expect("accept failed");
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.expect("read failed");
+                let request = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let conditional = request.contains("if-none-match: \"v1\"");
+                conditional_requests.push(conditional);
+
+                let response = if conditional {
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\n\
+                         ETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        RSS.len(),
+                        RSS
+                    )
+                };
+                sock.write_all(response.as_bytes()).await.expect("write failed");
+                sock.flush().await.expect("flush failed");
+            }
+            conditional_requests
+        });
+
+        let fetcher = FeedFetcher::new();
+        let feed = Feed::new(
+            "test-feed".to_string(),
+            "Test Feed".to_string(),
+            format!("http://{addr}/feed.xml"),
+            None,
+            None,
+        );
+        assert!(feed.etag.is_none(), "a new feed has nothing to replay");
+
+        let FetchOutcome::Fetched { feed: fetched, articles } =
+            fetcher.fetch_feed(&feed).await.expect("first fetch failed")
+        else {
+            panic!("the first fetch should return a body");
+        };
+        assert_eq!(fetched.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(articles.len(), 1);
+
+        let second = fetcher.fetch_feed(&fetched).await.expect("second fetch failed");
+        assert!(
+            matches!(second, FetchOutcome::NotModified),
+            "an unchanged feed should come back as NotModified"
+        );
+
+        let conditional_requests = server.await.expect("server task panicked");
+        assert_eq!(
+            conditional_requests,
+            vec![false, true],
+            "only the second request should carry the validator"
+        );
+    }
+
     /// The matcher runs over bytes when everything is ASCII and over chars
     /// otherwise; both paths have to fold case and find word starts the same
     /// way.
