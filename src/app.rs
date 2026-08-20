@@ -37,9 +37,16 @@ pub enum AppEvent {
         new_articles_count: usize,
         error: Option<String>,
     },
+    /// A feed added from the modal, already written to the database by the
+    /// task that fetched it.
     AddFeedFinished {
-        feed: Option<Feed>,
-        articles: Vec<Article>,
+        title: Option<String>,
+        article_count: usize,
+        error: Option<String>,
+    },
+    /// An OPML file parsed and imported off the UI thread.
+    ImportFinished {
+        feed_count: usize,
         error: Option<String>,
     },
 }
@@ -153,6 +160,13 @@ pub struct App {
     pub event_receiver: Receiver<AppEvent>,
 
     pub should_quit: bool,
+
+    /// Settings changed since the last write to disk.
+    ///
+    /// Holding `→` on the refresh-interval row used to serialize and rewrite
+    /// config.toml on every repeat; the writes are coalesced onto the tick
+    /// instead, which is at most one every 250ms and never in the key path.
+    config_dirty: bool,
 }
 
 impl App {
@@ -235,6 +249,7 @@ impl App {
             event_receiver,
 
             should_quit: false,
+            config_dirty: false,
         };
 
         app.reload_data();
@@ -367,6 +382,23 @@ impl App {
         if self.sidebar_selected_idx >= self.sidebar_items.len() && !self.sidebar_items.is_empty() {
             self.sidebar_selected_idx = self.sidebar_items.len() - 1;
         }
+    }
+
+    /// Expand or collapse a folder in the sidebar.
+    ///
+    /// Only the sidebar tree changes shape, so this rebuilds that and nothing
+    /// else. It used to call `reload_data()`, which re-queried every feed,
+    /// every unread count and the whole article list to redraw one triangle.
+    fn toggle_folder(&mut self, folder: &str) {
+        let Ok(expanded) = self.db.toggle_folder_expanded(folder) else {
+            return;
+        };
+        if expanded {
+            self.collapsed_folders.remove(folder);
+        } else {
+            self.collapsed_folders.insert(folder.to_string());
+        }
+        self.rebuild_sidebar_items();
     }
 
     pub fn reload_articles(&mut self) {
@@ -556,8 +588,10 @@ impl App {
 
     pub fn on_tick(&mut self) -> bool {
         self.tick_count = self.tick_count.wrapping_add(1);
+        self.flush_config();
 
         let mut had_updates = false;
+        let mut refresh_after_import = false;
         while let Ok(event) = self.event_receiver.try_recv() {
             match event {
                 AppEvent::FeedRefreshFinished {
@@ -580,8 +614,8 @@ impl App {
                     }
                 }
                 AppEvent::AddFeedFinished {
-                    feed,
-                    articles,
+                    title,
+                    article_count,
                     error,
                 } => {
                     self.modal_is_loading = false;
@@ -591,17 +625,32 @@ impl App {
                         self.sync_start_time = None;
                     }
 
-                    if let Some(f) = feed {
-                        let title = f.title.clone();
-                        let _ = self.db.add_or_update_feed(&f);
-                        if !articles.is_empty() {
-                            let _ = self.db.insert_articles(&articles);
-                        }
+                    if let Some(title) = title {
                         self.show_add_modal = false;
-                        self.set_toast(format!("Added feed: {title} ({} articles)", articles.len()));
+                        self.set_toast(format!("Added feed: {title} ({article_count} articles)"));
                         had_updates = true;
                     } else if let Some(err) = error {
                         self.modal_error = Some(err);
+                    }
+                }
+                AppEvent::ImportFinished { feed_count, error } => {
+                    self.modal_is_loading = false;
+                    self.pending_fetches = self.pending_fetches.saturating_sub(1);
+                    if self.pending_fetches == 0 {
+                        self.is_syncing = false;
+                        self.sync_start_time = None;
+                    }
+
+                    if let Some(err) = error {
+                        self.modal_error = Some(err);
+                    } else {
+                        self.show_add_modal = false;
+                        self.set_toast(format!("Successfully imported {feed_count} feeds from OPML"));
+                        // The feeds are in the database but have no articles
+                        // yet; pull them once the reload below has picked the
+                        // new subscriptions up.
+                        refresh_after_import = true;
+                        had_updates = true;
                     }
                 }
             }
@@ -623,6 +672,9 @@ impl App {
         if had_updates {
             self.reload_data();
         }
+        if refresh_after_import {
+            self.refresh_all_feeds();
+        }
 
         // Auto dismiss toast after 4 seconds
         if let Some(time) = self.toast_time {
@@ -639,9 +691,22 @@ impl App {
     /// Show or hide the compact shortcut hints in the status bar (`??`).
     pub fn toggle_help_hints(&mut self) {
         self.config.show_help_hints = !self.config.show_help_hints;
-        let _ = self.config.save();
+        self.queue_config_save();
         let status = if self.config.show_help_hints { "shown" } else { "hidden" };
         self.set_toast(format!("Shortcut hints {status}"));
+    }
+
+    /// Mark the settings as needing a save; the write happens on the next tick.
+    fn queue_config_save(&mut self) {
+        self.config_dirty = true;
+    }
+
+    /// Write pending settings changes to disk, if there are any.
+    pub fn flush_config(&mut self) {
+        if self.config_dirty {
+            let _ = self.config.save();
+            self.config_dirty = false;
+        }
     }
 
     pub fn set_toast<S: Into<String>>(&mut self, msg: S) {
@@ -649,7 +714,12 @@ impl App {
         self.toast_time = Some(Instant::now());
     }
 
-    pub fn handle_key_event(&mut self, key: KeyEvent) {
+    /// Handle a key press, reporting whether anything the UI draws changed.
+    ///
+    /// The event loop only repaints when this says so: a key that matches no
+    /// binding, or a modal key that falls through, leaves the screen exactly as
+    /// it was and does not deserve a frame.
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         // 1. Help Modal Handler
         //
         // Pressing the help key a second time (`??`) closes the modal *and*
@@ -662,15 +732,14 @@ impl App {
                     self.toggle_help_hints();
                 }
                 KeyCode::Esc | KeyCode::Char('q') => self.show_help_modal = false,
-                _ => {}
+                _ => return false,
             }
-            return;
+            return true;
         }
 
         // 2. Configuration Menu Popup Modal Handler
         if self.show_config_modal {
-            self.handle_config_modal_key(key);
-            return;
+            return self.handle_config_modal_key(key);
         }
 
         // 3. Theme Picker Modal Handler
@@ -691,14 +760,16 @@ impl App {
                     if let Some(th) = self.all_themes.get(self.theme_picker_selected_idx) {
                         self.theme = th.clone();
                         self.config.theme = th.config.name.clone();
-                        let _ = self.config.save();
+                        // Field assignment rather than the helper: `th` still
+                        // borrows `self.all_themes` here.
+                        self.config_dirty = true;
                         self.set_toast(format!("Applied theme: {}", th.config.name));
                     }
                     self.show_theme_modal = false;
                 }
-                _ => {}
+                _ => return false,
             }
-            return;
+            return true;
         }
 
         // 4. Add Feed Modal Handler
@@ -734,9 +805,9 @@ impl App {
                 KeyCode::Enter => {
                     self.submit_add_modal();
                 }
-                _ => {}
+                _ => return false,
             }
-            return;
+            return true;
         }
 
         // 5. Export Modal Handler
@@ -752,9 +823,9 @@ impl App {
                 KeyCode::Enter => {
                     self.submit_export_modal();
                 }
-                _ => {}
+                _ => return false,
             }
-            return;
+            return true;
         }
 
         // 6. Delete Confirmation Modal Handler
@@ -765,9 +836,9 @@ impl App {
                     self.confirm_delete_selected();
                     self.show_delete_modal = false;
                 }
-                _ => {}
+                _ => return false,
             }
-            return;
+            return true;
         }
 
         // 7a. Feed search input mode (sidebar)
@@ -801,9 +872,9 @@ impl App {
                 KeyCode::Char(c) => {
                     self.set_feed_search(|q| q.push(c));
                 }
-                _ => {}
+                _ => return false,
             }
-            return;
+            return true;
         }
 
         // 7. Search input mode
@@ -824,9 +895,9 @@ impl App {
                 KeyCode::Char(c) => {
                     self.set_search_query(|q| q.push(c));
                 }
-                _ => {}
+                _ => return false,
             }
-            return;
+            return true;
         }
 
         // 8. Configurable Global & Pane Keybindings
@@ -835,17 +906,18 @@ impl App {
         if kb.matches(&key, &kb.toggle_config) {
             self.show_config_modal = !self.show_config_modal;
             self.config_menu_subview = ConfigSubView::Main;
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.quit) {
+            self.flush_config();
             self.should_quit = true;
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.help) {
             self.show_help_modal = true;
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.theme_picker) {
@@ -855,7 +927,7 @@ impl App {
                 .iter()
                 .position(|t| t.config.name.eq_ignore_ascii_case(&self.theme.config.name))
                 .unwrap_or(0);
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.add_feed) {
@@ -866,96 +938,96 @@ impl App {
             self.modal_focused_field = 0;
             self.modal_error = None;
             self.modal_is_loading = false;
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.export_opml) {
             self.show_export_modal = true;
             self.modal_export_status = None;
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.delete_item) {
             if self.active_pane == ActivePane::Sidebar {
                 self.show_delete_modal = true;
             }
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.toggle_zen) {
             self.is_zen_mode = !self.is_zen_mode;
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.search) {
             self.active_pane = ActivePane::ArticleList;
             self.is_searching = true;
             self.set_search_query(|q| q.clear());
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.search_feeds) {
             self.active_pane = ActivePane::Sidebar;
             self.is_searching_feeds = true;
             self.set_feed_search(|q| q.clear());
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.refresh_current) {
             self.refresh_current_feed();
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.refresh_all) {
             self.refresh_all_feeds();
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.toggle_read) {
             self.toggle_current_article_read();
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.mark_all_read) {
             self.mark_all_in_view_read();
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.toggle_star) {
             self.toggle_current_article_star();
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.open_browser) {
             self.open_current_article_in_browser();
-            return;
+            return true;
         }
 
         if kb.matches(&key, &kb.copy_url) {
             self.copy_current_article_url();
-            return;
+            return true;
         }
 
         // Pane navigation
         if kb.matches(&key, &kb.focus_next_pane) {
             self.active_pane = self.active_pane.next();
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.focus_prev_pane) {
             self.active_pane = self.active_pane.prev();
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.focus_sidebar) {
             self.active_pane = ActivePane::Sidebar;
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.focus_article_list) {
             self.active_pane = ActivePane::ArticleList;
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.focus_reader) {
             self.active_pane = ActivePane::Reader;
-            return;
+            return true;
         }
 
         // Pane resizing
@@ -964,87 +1036,89 @@ impl App {
                 self.sidebar_width_percent -= 2;
                 self.reader_width_percent += 2;
             }
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.resize_sidebar_inc) {
             if self.sidebar_width_percent < 40 {
                 self.sidebar_width_percent += 2;
                 self.reader_width_percent = self.reader_width_percent.saturating_sub(2);
             }
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.resize_article_dec) {
             if self.article_width_percent > 18 {
                 self.article_width_percent -= 2;
                 self.reader_width_percent += 2;
             }
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.resize_article_inc) {
             if self.article_width_percent < 55 {
                 self.article_width_percent += 2;
                 self.reader_width_percent = self.reader_width_percent.saturating_sub(2);
             }
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.resize_reader_inc) {
             if self.reader_width_percent < 75 {
                 self.reader_width_percent += 2;
                 self.article_width_percent = self.article_width_percent.saturating_sub(2);
             }
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.resize_reader_dec) {
             if self.reader_width_percent > 20 {
                 self.reader_width_percent -= 2;
                 self.article_width_percent += 2;
             }
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.reset_layout) {
             self.sidebar_width_percent = self.config.sidebar_ratio;
             self.article_width_percent = self.config.article_list_ratio;
             self.reader_width_percent = self.config.reader_ratio;
             self.set_toast("Reset pane layout ratios");
-            return;
+            return true;
         }
 
         // Navigation inside pane
         if kb.matches(&key, &kb.nav_down) {
-            self.navigate_down();
-            return;
+            return self.navigate_down();
         }
         if kb.matches(&key, &kb.nav_up) {
-            self.navigate_up();
-            return;
+            return self.navigate_up();
         }
         if kb.matches(&key, &kb.page_down) {
             self.page_down();
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.page_up) {
             self.page_up();
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.space_advance) {
             self.space_advance();
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.jump_top) {
             self.jump_to_top();
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.jump_bottom) {
             self.jump_to_bottom();
-            return;
+            return true;
         }
         if kb.matches(&key, &kb.select_enter) {
             self.handle_enter_key();
-            return;
+            return true;
         }
+
+        // Nothing matched: the key did nothing, so nothing needs redrawing.
+        false
     }
 
-    fn handle_config_modal_key(&mut self, key: KeyEvent) {
+    /// Returns whether the key changed anything on screen.
+    fn handle_config_modal_key(&mut self, key: KeyEvent) -> bool {
         match self.config_menu_subview {
             ConfigSubView::Keybindings => match key.code {
                 KeyCode::Esc | KeyCode::Backspace => {
@@ -1062,13 +1136,13 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     self.config.keybindings = KeyBindingsConfig::default();
-                    let _ = self.config.save();
+                    self.queue_config_save();
                     self.set_toast("Reset keybindings to defaults");
                 }
                 KeyCode::Char('q') => {
                     self.show_config_modal = false;
                 }
-                _ => {}
+                _ => return false,
             },
             ConfigSubView::Main => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('/') => {
@@ -1093,9 +1167,10 @@ impl App {
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     self.activate_config_item();
                 }
-                _ => {}
+                _ => return false,
             },
         }
+        true
     }
 
     fn modify_config_item(&mut self, forward: bool) {
@@ -1107,7 +1182,7 @@ impl App {
             1 => {
                 // Auto-refresh on startup toggle
                 self.config.auto_refresh_on_startup = !self.config.auto_refresh_on_startup;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.auto_refresh_on_startup { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Auto-refresh on startup: {status}"));
             }
@@ -1118,27 +1193,27 @@ impl App {
                 } else {
                     self.config.refresh_interval_minutes = self.config.refresh_interval_minutes.saturating_sub(5).max(1);
                 }
-                let _ = self.config.save();
+                self.queue_config_save();
                 self.set_toast(format!("Refresh interval: {} min", self.config.refresh_interval_minutes));
             }
             3 => {
                 // Mark read on open
                 self.config.mark_read_on_open = !self.config.mark_read_on_open;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.mark_read_on_open { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Mark read on open: {status}"));
             }
             4 => {
                 // Wrap article text
                 self.config.wrap_article_text = !self.config.wrap_article_text;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.wrap_article_text { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Wrap article text: {status}"));
             }
             5 => {
                 // Show icons
                 self.config.show_icons = !self.config.show_icons;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.show_icons { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Show icons & badges: {status}"));
             }
@@ -1149,7 +1224,7 @@ impl App {
                 } else {
                     self.config.padding.saturating_sub(1)
                 };
-                let _ = self.config.save();
+                self.queue_config_save();
                 self.invalidate_reader_cache();
                 self.set_toast(format!("Padding: {} cell(s)", self.config.padding));
             }
@@ -1160,7 +1235,7 @@ impl App {
                 } else {
                     self.config.article_spacing.saturating_sub(1)
                 };
-                let _ = self.config.save();
+                self.queue_config_save();
                 self.set_toast(format!(
                     "Article spacing: {} row(s)",
                     crate::ui::article_list::spacing_label(self.config.article_spacing)
@@ -1183,7 +1258,7 @@ impl App {
                 self.config.sidebar_ratio = self.sidebar_width_percent;
                 self.config.article_list_ratio = self.article_width_percent;
                 self.config.reader_ratio = self.reader_width_percent;
-                let _ = self.config.save();
+                self.queue_config_save();
             }
             10 => {
                 // Keybindings subview
@@ -1207,7 +1282,7 @@ impl App {
             }
             1 => {
                 self.config.auto_refresh_on_startup = !self.config.auto_refresh_on_startup;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.auto_refresh_on_startup { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Auto-refresh on startup: {status}"));
             }
@@ -1218,31 +1293,31 @@ impl App {
                     16..=30 => 60,
                     _ => 5,
                 };
-                let _ = self.config.save();
+                self.queue_config_save();
                 self.set_toast(format!("Refresh interval: {} min", self.config.refresh_interval_minutes));
             }
             3 => {
                 self.config.mark_read_on_open = !self.config.mark_read_on_open;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.mark_read_on_open { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Mark read on open: {status}"));
             }
             4 => {
                 self.config.wrap_article_text = !self.config.wrap_article_text;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.wrap_article_text { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Wrap article text: {status}"));
             }
             5 => {
                 self.config.show_icons = !self.config.show_icons;
-                let _ = self.config.save();
+                self.queue_config_save();
                 let status = if self.config.show_icons { "Enabled" } else { "Disabled" };
                 self.set_toast(format!("Show icons & badges: {status}"));
             }
             6 => {
                 // Cycle padding, wrapping back to none.
                 self.config.padding = (self.config.padding + 1) % (MAX_PADDING + 1);
-                let _ = self.config.save();
+                self.queue_config_save();
                 self.invalidate_reader_cache();
                 self.set_toast(format!("Padding: {} cell(s)", self.config.padding));
             }
@@ -1250,7 +1325,7 @@ impl App {
                 // Cycle spacing, wrapping back to flush.
                 self.config.article_spacing =
                     (self.config.article_spacing + 1) % (MAX_ARTICLE_SPACING + 1);
-                let _ = self.config.save();
+                self.queue_config_save();
                 self.set_toast(format!(
                     "Article spacing: {} row(s)",
                     crate::ui::article_list::spacing_label(self.config.article_spacing)
@@ -1266,7 +1341,7 @@ impl App {
                 self.config.sidebar_ratio = 22;
                 self.config.article_list_ratio = 33;
                 self.config.reader_ratio = 45;
-                let _ = self.config.save();
+                self.queue_config_save();
                 self.set_toast("Reset pane layout ratios to 22/33/45");
             }
             10 => {
@@ -1298,28 +1373,45 @@ impl App {
         if let Some(th) = self.all_themes.get(next_idx) {
             self.theme = th.clone();
             self.config.theme = th.config.name.clone();
-            let _ = self.config.save();
+            self.config_dirty = true;
             self.set_toast(format!("Applied theme: {}", th.config.name));
         }
     }
 
-    pub fn handle_mouse_event(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+    /// Handle a mouse event, reporting whether anything the UI draws changed.
+    ///
+    /// A wheel click that is already at the end of a list, or a button the app
+    /// ignores, leaves the screen identical and so does not ask for a frame.
+    pub fn handle_mouse_event(&mut self, mouse: MouseEvent, width: u16, height: u16) -> bool {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
-                self.handle_mouse_scroll(mouse.column, mouse.row, width, height, true);
+                self.handle_mouse_scroll(mouse.column, mouse.row, width, height, true)
             }
             MouseEventKind::ScrollUp => {
-                self.handle_mouse_scroll(mouse.column, mouse.row, width, height, false);
+                self.handle_mouse_scroll(mouse.column, mouse.row, width, height, false)
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_mouse_click(mouse.column, mouse.row, width, height);
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
-    fn handle_mouse_scroll(&mut self, col: u16, _row: u16, width: u16, _height: u16, down: bool) {
+    /// Scroll the reader by `amount` rows, reporting whether it moved.
+    fn scroll_reader(&mut self, down: bool, amount: usize) -> bool {
+        let before = self.reader_scroll_offset;
+        self.reader_scroll_offset = if down {
+            before.saturating_add(amount)
+        } else {
+            before.saturating_sub(amount)
+        };
+        self.reader_scroll_offset != before
+    }
+
+    fn handle_mouse_scroll(&mut self, col: u16, _row: u16, width: u16, _height: u16, down: bool) -> bool {
         if self.show_theme_modal {
+            let before = self.theme_picker_selected_idx;
             if down {
                 if self.theme_picker_selected_idx + 1 < self.all_themes.len() {
                     self.theme_picker_selected_idx += 1;
@@ -1327,11 +1419,12 @@ impl App {
             } else if self.theme_picker_selected_idx > 0 {
                 self.theme_picker_selected_idx -= 1;
             }
-            return;
+            return self.theme_picker_selected_idx != before;
         }
 
         if self.show_config_modal {
             if self.config_menu_subview == ConfigSubView::Keybindings {
+                let before = self.config_keybind_selected_idx;
                 if down {
                     if self.config_keybind_selected_idx + 1 < KEYBIND_ROWS {
                         self.config_keybind_selected_idx += 1;
@@ -1339,53 +1432,48 @@ impl App {
                 } else if self.config_keybind_selected_idx > 0 {
                     self.config_keybind_selected_idx -= 1;
                 }
-            } else {
-                if down {
-                    if self.config_menu_selected_idx + 1 < CONFIG_MENU_ITEMS {
-                        self.config_menu_selected_idx += 1;
-                    }
-                } else if self.config_menu_selected_idx > 0 {
-                    self.config_menu_selected_idx -= 1;
-                }
+                return self.config_keybind_selected_idx != before;
             }
-            return;
+            let before = self.config_menu_selected_idx;
+            if down {
+                if self.config_menu_selected_idx + 1 < CONFIG_MENU_ITEMS {
+                    self.config_menu_selected_idx += 1;
+                }
+            } else if self.config_menu_selected_idx > 0 {
+                self.config_menu_selected_idx -= 1;
+            }
+            return self.config_menu_selected_idx != before;
         }
 
         let sidebar_w = width * self.sidebar_width_percent / 100;
         let article_w = width * self.article_width_percent / 100;
 
         if self.is_zen_mode {
-            match self.active_pane {
-                ActivePane::Sidebar => {
-                    if down { self.navigate_down(); } else { self.navigate_up(); }
+            return match self.active_pane {
+                ActivePane::Sidebar | ActivePane::ArticleList => {
+                    if down { self.navigate_down() } else { self.navigate_up() }
                 }
-                ActivePane::ArticleList => {
-                    if down { self.navigate_down(); } else { self.navigate_up(); }
-                }
-                ActivePane::Reader => {
-                    if down {
-                        self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(3);
-                    } else {
-                        self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(3);
-                    }
-                }
-            }
-            return;
+                ActivePane::Reader => self.scroll_reader(down, 3),
+            };
         }
 
+        // Scrolling over a pane also focuses it, which is a visible change in
+        // its own right even when the list underneath cannot move.
         if col < sidebar_w {
+            let refocused = self.active_pane != ActivePane::Sidebar;
             self.active_pane = ActivePane::Sidebar;
-            if down { self.navigate_down(); } else { self.navigate_up(); }
+            let moved = if down { self.navigate_down() } else { self.navigate_up() };
+            refocused || moved
         } else if col < sidebar_w + article_w {
+            let refocused = self.active_pane != ActivePane::ArticleList;
             self.active_pane = ActivePane::ArticleList;
-            if down { self.navigate_down(); } else { self.navigate_up(); }
+            let moved = if down { self.navigate_down() } else { self.navigate_up() };
+            refocused || moved
         } else {
+            let refocused = self.active_pane != ActivePane::Reader;
             self.active_pane = ActivePane::Reader;
-            if down {
-                self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(3);
-            } else {
-                self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(3);
-            }
+            let moved = self.scroll_reader(down, 3);
+            refocused || moved
         }
     }
 
@@ -1410,7 +1498,9 @@ impl App {
                         self.theme_picker_selected_idx = target_idx;
                         self.theme = th.clone();
                         self.config.theme = th.config.name.clone();
-                        let _ = self.config.save();
+                        // Field assignment rather than the helper: `th` still
+                        // borrows `self.all_themes` here.
+                        self.config_dirty = true;
                         self.set_toast(format!("Applied theme: {}", th.config.name));
                         self.show_theme_modal = false;
                     }
@@ -1551,8 +1641,7 @@ impl App {
                 self.sidebar_selected_idx = clicked_row;
                 if let Some(SidebarItem::FolderHeader { name, .. }) = self.sidebar_items.get(clicked_row) {
                     let folder_name = name.clone();
-                    let _ = self.db.toggle_folder_expanded(&folder_name);
-                    self.reload_data();
+                    self.toggle_folder(&folder_name);
                 } else {
                     self.apply_sidebar_selection();
                 }
@@ -1616,7 +1705,11 @@ impl App {
         }
     }
 
-    fn navigate_down(&mut self) {
+    /// Move one step down the focused pane, reporting whether it moved.
+    ///
+    /// Holding `j` at the end of a list produces a burst of events that change
+    /// nothing; saying so here is what lets the event loop skip those frames.
+    fn navigate_down(&mut self) -> bool {
         match self.active_pane {
             ActivePane::Sidebar => {
                 if self.sidebar_selected_idx + 1 < self.sidebar_items.len() {
@@ -1625,6 +1718,9 @@ impl App {
                         self.sidebar_selected_idx += 1;
                     }
                     self.apply_sidebar_selection();
+                    true
+                } else {
+                    false
                 }
             }
             ActivePane::ArticleList => {
@@ -1634,15 +1730,17 @@ impl App {
                     if self.config.mark_read_on_open {
                         self.mark_current_article_read();
                     }
+                    true
+                } else {
+                    false
                 }
             }
-            ActivePane::Reader => {
-                self.reader_scroll_offset = self.reader_scroll_offset.saturating_add(2);
-            }
+            ActivePane::Reader => self.scroll_reader(true, 2),
         }
     }
 
-    fn navigate_up(&mut self) {
+    /// Move one step up the focused pane, reporting whether it moved.
+    fn navigate_up(&mut self) -> bool {
         match self.active_pane {
             ActivePane::Sidebar => {
                 if self.sidebar_selected_idx > 0 {
@@ -1653,6 +1751,9 @@ impl App {
                         }
                     }
                     self.apply_sidebar_selection();
+                    true
+                } else {
+                    false
                 }
             }
             ActivePane::ArticleList => {
@@ -1662,11 +1763,12 @@ impl App {
                     if self.config.mark_read_on_open {
                         self.mark_current_article_read();
                     }
+                    true
+                } else {
+                    false
                 }
             }
-            ActivePane::Reader => {
-                self.reader_scroll_offset = self.reader_scroll_offset.saturating_sub(2);
-            }
+            ActivePane::Reader => self.scroll_reader(false, 2),
         }
     }
 
@@ -1744,8 +1846,8 @@ impl App {
             ActivePane::Sidebar => {
                 if let Some(item) = self.sidebar_items.get(self.sidebar_selected_idx) {
                     if let SidebarItem::FolderHeader { name, .. } = item {
-                        let _ = self.db.toggle_folder_expanded(name);
-                        self.reload_data();
+                        let folder = name.clone();
+                        self.toggle_folder(&folder);
                         return;
                     }
                 }
@@ -2024,22 +2126,37 @@ impl App {
         }
 
         if self.modal_is_opml_mode {
-            // Import OPML file
-            match parse_opml_file(&input) {
-                Ok(feeds) => {
-                    let count = feeds.len();
-                    for f in feeds {
-                        let _ = self.db.add_or_update_feed(&f);
+            // Import OPML off the UI thread: a large subscription list means
+            // parsing a file and one database write per feed, which is far too
+            // much to do inside a key handler.
+            self.modal_is_loading = true;
+            self.modal_error = None;
+            self.pending_fetches += 1;
+            self.is_syncing = true;
+            self.sync_start_time = Some(Instant::now());
+
+            let tx = self.event_sender.clone();
+            let db = self.db.clone();
+
+            self.tokio_handle.spawn(async move {
+                let event = match parse_opml_file(&input) {
+                    Ok(feeds) => {
+                        let count = feeds.len();
+                        for f in &feeds {
+                            let _ = db.add_or_update_feed(f);
+                        }
+                        AppEvent::ImportFinished {
+                            feed_count: count,
+                            error: None,
+                        }
                     }
-                    self.show_add_modal = false;
-                    self.reload_data();
-                    self.refresh_all_feeds();
-                    self.set_toast(format!("Successfully imported {count} feeds from OPML"));
-                }
-                Err(e) => {
-                    self.modal_error = Some(e);
-                }
-            }
+                    Err(e) => AppEvent::ImportFinished {
+                        feed_count: 0,
+                        error: Some(e),
+                    },
+                };
+                let _ = tx.send(event);
+            });
         } else {
             // Single Feed URL
             let folder = if self.modal_folder_input.trim().is_empty() {
@@ -2056,25 +2173,34 @@ impl App {
 
             let fetcher = self.fetcher.clone();
             let tx = self.event_sender.clone();
+            let db = self.db.clone();
 
             self.tokio_handle.spawn(async move {
                 let res = fetcher.discover_or_create_feed(&input, folder).await;
-                match res {
+                let event = match res {
                     Ok((feed, articles)) => {
-                        let _ = tx.send(AppEvent::AddFeedFinished {
-                            feed: Some(feed),
-                            articles,
+                        // Write here rather than back on the UI thread: a feed
+                        // with a few hundred articles is a real stall.
+                        let title = feed.title.clone();
+                        let _ = db.add_or_update_feed(&feed);
+                        let count = if articles.is_empty() {
+                            0
+                        } else {
+                            db.insert_articles(&articles).unwrap_or(0)
+                        };
+                        AppEvent::AddFeedFinished {
+                            title: Some(title),
+                            article_count: count,
                             error: None,
-                        });
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::AddFeedFinished {
-                            feed: None,
-                            articles: Vec::new(),
-                            error: Some(e),
-                        });
-                    }
-                }
+                    Err(e) => AppEvent::AddFeedFinished {
+                        title: None,
+                        article_count: 0,
+                        error: Some(e),
+                    },
+                };
+                let _ = tx.send(event);
             });
         }
     }

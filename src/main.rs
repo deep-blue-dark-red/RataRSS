@@ -157,14 +157,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Event::Key(key) => {
                         // Only process Press events (avoid double triggers on Windows/macOS)
                         if key.kind == crossterm::event::KeyEventKind::Press {
-                            app.handle_key_event(key);
-                            needs_redraw = true;
+                            // The handlers report whether they changed anything
+                            // the UI draws, so a key that matches no binding or
+                            // a `j` at the end of the list costs no frame.
+                            needs_redraw |= app.handle_key_event(key);
                         }
                     }
                     Event::Mouse(mouse) => {
                         let size = terminal.size().unwrap_or_default();
-                        app.handle_mouse_event(mouse, size.width, size.height);
-                        needs_redraw = true;
+                        needs_redraw |= app.handle_mouse_event(mouse, size.width, size.height);
                     }
                     Event::Resize(_, _) => {
                         needs_redraw = true;
@@ -186,6 +187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_tick = Instant::now();
         }
     }
+
+    // Settings writes are coalesced onto the tick, so flush anything still
+    // pending before the process goes away.
+    app.flush_config();
 
     // Restore terminal
     disable_raw_mode()?;

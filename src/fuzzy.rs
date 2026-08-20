@@ -15,14 +15,58 @@ const PREFIX: i32 = 8;
 /// Charged per skipped character, so tighter matches rank higher.
 const GAP: i32 = 1;
 
+/// One unit of text the matcher can work over.
+///
+/// Everything below is written against this rather than `char` so the common
+/// case — an ASCII title and an ASCII query — can run straight over the string's
+/// bytes. That matters because the matcher used to collect a `Vec<char>` for
+/// every field of every article on every keystroke; on the bytes path there is
+/// no allocation at all.
+trait Unit: Copy + PartialEq {
+    fn lower(self) -> Self;
+    fn is_alnum(self) -> bool;
+    fn is_lower(self) -> bool;
+    fn is_upper(self) -> bool;
+}
+
+impl Unit for u8 {
+    fn lower(self) -> Self {
+        self.to_ascii_lowercase()
+    }
+    fn is_alnum(self) -> bool {
+        self.is_ascii_alphanumeric()
+    }
+    fn is_lower(self) -> bool {
+        self.is_ascii_lowercase()
+    }
+    fn is_upper(self) -> bool {
+        self.is_ascii_uppercase()
+    }
+}
+
+impl Unit for char {
+    fn lower(self) -> Self {
+        self.to_lowercase().next().unwrap_or(self)
+    }
+    fn is_alnum(self) -> bool {
+        self.is_alphanumeric()
+    }
+    fn is_lower(self) -> bool {
+        self.is_lowercase()
+    }
+    fn is_upper(self) -> bool {
+        self.is_uppercase()
+    }
+}
+
 /// Is `haystack[idx]` the first character of a word?
-fn is_word_start(chars: &[char], idx: usize) -> bool {
+fn is_word_start<T: Unit>(chars: &[T], idx: usize) -> bool {
     if idx == 0 {
         return true;
     }
     let prev = chars[idx - 1];
     let cur = chars[idx];
-    !prev.is_alphanumeric() || (prev.is_lowercase() && cur.is_uppercase())
+    !prev.is_alnum() || (prev.is_lower() && cur.is_upper())
 }
 
 /// Score one alignment, or `None` if the needle is not a subsequence.
@@ -30,7 +74,7 @@ fn is_word_start(chars: &[char], idx: usize) -> bool {
 /// `boundary_first` makes each character prefer the next word-start occurrence
 /// over the next occurrence of any kind, which is what makes "bm" rank
 /// "Bloomberg Markets" above a mid-word coincidence.
-fn score_alignment(hay: &[char], needle: &[char], boundary_first: bool) -> Option<i32> {
+fn score_alignment<T: Unit>(hay: &[T], needle: &[T], boundary_first: bool) -> Option<i32> {
     let mut score = 0;
     let mut hay_idx = 0usize;
     let mut prev_match: Option<usize> = None;
@@ -42,7 +86,7 @@ fn score_alignment(hay: &[char], needle: &[char], boundary_first: bool) -> Optio
 
         for (offset, &c) in hay[hay_idx..].iter().enumerate() {
             let at = hay_idx + offset;
-            if c.to_lowercase().next() != Some(want) {
+            if c.lower() != want {
                 continue;
             }
             if first_any.is_none() {
@@ -98,16 +142,29 @@ pub fn score(haystack: &str, needle_lower: &str) -> Option<i32> {
         return None;
     }
 
+    // Fast path: plain ASCII on both sides, matched over the raw bytes with no
+    // intermediate allocation. Titles, feed names and typed queries are almost
+    // always ASCII, and this runs over every field of every article per
+    // keystroke.
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        return best_score(haystack.as_bytes(), needle_lower.as_bytes());
+    }
+
     let hay: Vec<char> = haystack.chars().collect();
     let needle: Vec<char> = needle_lower.chars().collect();
+    best_score(&hay, &needle)
+}
+
+/// Better of the two alignments, or `None` if the needle is not a subsequence.
+fn best_score<T: Unit>(hay: &[T], needle: &[T]) -> Option<i32> {
     if needle.len() > hay.len() {
         return None;
     }
 
-    let greedy = score_alignment(&hay, &needle, false);
+    let greedy = score_alignment(hay, needle, false);
     // No point running the boundary pass if the needle isn't present at all.
     greedy?;
-    let boundary = score_alignment(&hay, &needle, true);
+    let boundary = score_alignment(hay, needle, true);
     Some(greedy.unwrap_or(i32::MIN).max(boundary.unwrap_or(i32::MIN)))
 }
 

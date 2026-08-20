@@ -48,9 +48,13 @@ pub struct FormattedArticle {
 impl FormattedArticle {
     /// The URL at a text-area coordinate, if a link was drawn there.
     pub fn link_at(&self, line: usize, col: u16) -> Option<&str> {
-        self.hits
+        // `hits` is built in line order and a long article can hold hundreds of
+        // them, so seek to the requested line instead of scanning the lot.
+        let start = self.hits.partition_point(|h| h.line < line);
+        self.hits[start..]
             .iter()
-            .find(|h| h.line == line && col >= h.start_col && col < h.end_col)
+            .take_while(|h| h.line == line)
+            .find(|h| col >= h.start_col && col < h.end_col)
             .and_then(|h| self.links.get(h.link))
             .map(String::as_str)
     }
@@ -195,6 +199,12 @@ pub fn parse_html_with_links(
     hits: &mut Vec<LinkHit>,
 ) -> Vec<Line<'static>> {
     let mut result = Vec::new();
+    // href → index in `links`, so anchors dedupe in constant time.
+    let mut link_index: std::collections::HashMap<String, usize> = links
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.clone(), i))
+        .collect();
     let unescaped = html_escape::decode_html_entities(html);
     let normalized = normalize_block_tags(&unescaped);
 
@@ -321,7 +331,7 @@ pub fn parse_html_with_links(
         // Standard Paragraph. Anchors stay as their own runs so they can be
         // styled as links and hit-tested after wrapping, instead of being
         // flattened into the surrounding prose.
-        let segments = split_anchors(p_trimmed, links);
+        let segments = split_anchors(p_trimmed, links, &mut link_index);
         for (line, line_hits) in wrap_segments(&segments, width, theme) {
             for hit in line_hits {
                 hits.push(LinkHit {
@@ -405,7 +415,11 @@ struct Segment {
 }
 
 /// Split a paragraph into plain and anchor runs, registering each anchor's href.
-fn split_anchors(paragraph: &str, links: &mut Vec<String>) -> Vec<Segment> {
+fn split_anchors(
+    paragraph: &str,
+    links: &mut Vec<String>,
+    index: &mut std::collections::HashMap<String, usize>,
+) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut last = 0;
 
@@ -421,12 +435,16 @@ fn split_anchors(paragraph: &str, links: &mut Vec<String>) -> Vec<Segment> {
 
         let label = strip_tags(text);
         if !href.is_empty() {
-            // Same URL twice in a document shares one entry.
-            let idx = match links.iter().position(|l| l == href) {
-                Some(i) => i,
+            // Same URL twice in a document shares one entry. The lookup goes
+            // through a map because a link-heavy document would otherwise make
+            // this quadratic in the number of anchors.
+            let idx = match index.get(href) {
+                Some(i) => *i,
                 None => {
                     links.push(href.to_string());
-                    links.len() - 1
+                    let i = links.len() - 1;
+                    index.insert(href.to_string(), i);
+                    i
                 }
             };
             // An anchor with no text (an image link, say) still needs

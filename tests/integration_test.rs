@@ -729,6 +729,61 @@ wrap_article_text = true
         assert!(score_any(["alpha", "beta"], "zz").is_none());
     }
 
+    /// The event loop repaints only when a handler reports a change, so the
+    /// handlers have to be honest: a key nothing is bound to, or a `k` that is
+    /// already at the top of the sidebar, must not ask for a frame.
+    #[tokio::test]
+    async fn key_handler_reports_whether_the_screen_changed() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        fn press(code: KeyCode) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            }
+        }
+
+        let rt = tokio::runtime::Handle::current();
+        let mut app = ratarss::App::new(rt).expect("app new failed");
+
+        // F9 is bindable but unbound by default: nothing happens, no redraw.
+        assert!(!app.handle_key_event(press(KeyCode::F(9))));
+
+        // The sidebar starts on 'Today', so the first `k` moves and the next
+        // one has nowhere left to go.
+        assert!(app.handle_key_event(press(KeyCode::Char('k'))));
+        assert!(!app.handle_key_event(press(KeyCode::Char('k'))));
+
+        // A key that opens a modal is always a change.
+        assert!(app.handle_key_event(press(KeyCode::Char('?'))));
+        // ...and one the modal ignores is not.
+        assert!(!app.handle_key_event(press(KeyCode::Char('z'))));
+    }
+
+    /// The matcher runs over bytes when everything is ASCII and over chars
+    /// otherwise; both paths have to fold case and find word starts the same
+    /// way.
+    #[test]
+    fn fuzzy_matches_non_ascii_text_too() {
+        use ratarss::fuzzy::score;
+
+        // Case folding on the char path.
+        assert!(score("ÉCOLE Normale", "é").is_some());
+        assert!(score("Café Central", "cc").is_some());
+        // A non-ASCII needle still cannot match text that lacks it.
+        assert!(score("Cafe Central", "é").is_none());
+        // Out of order still does not match.
+        assert!(score("Café Central", "lf").is_none());
+
+        // Ranking works the same as on the byte path: a prefix beats the same
+        // letters buried later in the title.
+        let prefix = score("Über Alles", "über").unwrap();
+        let buried = score("Das Über Ding", "über").unwrap();
+        assert!(prefix > buried, "prefix {prefix} should beat {buried}");
+    }
+
     #[test]
     fn article_slice_indexes_through_search_matches() {
         let articles: Vec<Article> = (0..5).map(article).collect();

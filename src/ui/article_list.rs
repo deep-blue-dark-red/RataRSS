@@ -1,6 +1,7 @@
 use crate::model::{ActivePane, ArticleSlice};
 use crate::theme::Theme;
 use chrono::{DateTime, Utc};
+use std::borrow::Cow;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -263,15 +264,18 @@ impl<'a> Widget for ArticleListView<'a> {
                     Style::default().fg(self.theme.article_meta_fg).add_modifier(Modifier::BOLD),
                 );
                 let feed_width = unicode_width::UnicodeWidthStr::width(feed_tag.as_str()) + 3;
-                let time_width = time_str.len() + 1;
+                // Display width, not byte length: the timestamp is positioned
+                // by counting cells back from the right edge.
+                let time_cells = unicode_width::UnicodeWidthStr::width(time_str.as_ref());
+                let time_width = time_cells + 1;
 
                 buf.set_span(text_x, y + 2, &feed_span, text_width);
 
                 if (text_width as usize) > feed_width + time_width + 1 {
                     let time_span =
-                        Span::styled(time_str.as_str(), Style::default().fg(self.theme.fg_subtle));
-                    let time_x = text_x + text_width - (time_str.len() as u16);
-                    buf.set_span(time_x, y + 2, &time_span, time_str.len() as u16);
+                        Span::styled(time_str.as_ref(), Style::default().fg(self.theme.fg_subtle));
+                    let time_x = text_x + text_width - (time_cells as u16);
+                    buf.set_span(time_x, y + 2, &time_span, time_cells as u16);
                 }
             }
 
@@ -279,29 +283,43 @@ impl<'a> Widget for ArticleListView<'a> {
     }
 }
 
-fn format_relative_time(date: &DateTime<Utc>, now: DateTime<Utc>) -> String {
+fn format_relative_time(date: &DateTime<Utc>, now: DateTime<Utc>) -> Cow<'static, str> {
     let duration = now.signed_duration_since(*date);
 
     if duration.num_seconds() < 60 {
-        "Just now".to_string()
+        Cow::Borrowed("Just now")
     } else if duration.num_minutes() < 60 {
-        format!("{}m ago", duration.num_minutes())
+        Cow::Owned(format!("{}m ago", duration.num_minutes()))
     } else if duration.num_hours() < 24 {
-        date.format("%I:%M %p").to_string()
+        Cow::Owned(date.format("%I:%M %p").to_string())
     } else if duration.num_days() == 1 {
-        "Yesterday".to_string()
+        Cow::Borrowed("Yesterday")
     } else if duration.num_days() < 7 {
-        date.format("%a %I:%M %p").to_string()
+        Cow::Owned(date.format("%a %I:%M %p").to_string())
     } else {
-        date.format("%b %d").to_string()
+        Cow::Owned(date.format("%b %d").to_string())
     }
 }
 
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else {
-        let prefix: String = s.chars().take(max_len.saturating_sub(1)).collect();
-        format!("{prefix}…")
+/// Clip `s` to `max_len` characters, borrowing when it already fits.
+///
+/// Every card runs this for its title and its summary, so the common case —
+/// text that fits — must not allocate. The length walk stops as soon as the
+/// limit is passed rather than counting the whole string.
+fn truncate_string(s: &str, max_len: usize) -> Cow<'_, str> {
+    match s.char_indices().nth(max_len) {
+        // Nothing beyond the limit: the string fits as it stands.
+        None => Cow::Borrowed(s),
+        Some(_) => {
+            let cut = s
+                .char_indices()
+                .nth(max_len.saturating_sub(1))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let mut out = String::with_capacity(cut + 3);
+            out.push_str(&s[..cut]);
+            out.push('…');
+            Cow::Owned(out)
+        }
     }
 }
